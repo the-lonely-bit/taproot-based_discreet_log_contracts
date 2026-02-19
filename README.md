@@ -626,7 +626,7 @@ The Claim PSBTs contains the adaptor signature pre-embedded in `taproot_sigs`. T
 This protocol specification and the open-source DLC builder are released under the **MIT License**:
 
 ```
-Copyright (c) 2024–2025 NexumBit contributors
+Copyright (c) 2025–2026 NexumBit contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
