@@ -1,0 +1,3 @@
+embit>=0.8.0
+# Optional: alternative for Taproot tweak (embit is sufficient)
+# coincurve>=21.0.0
