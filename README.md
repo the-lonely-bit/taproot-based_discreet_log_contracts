@@ -2,25 +2,29 @@
   <img src="https://zerobit.thelonelybit.org/nexumbit-logo.svg" width="72" height="72" alt="NexumBit Logo">
 </p>
 
-<h1 align="center">NexumBit | Because Cross-Chain Swaps Should Not Require Trust</h1>
+<h1 align="center">NexumBit Protocol</h1>
 <p align="center">
-  <strong>Trustless P2P Atomic Swaps between Bitcoin and Fractal Bitcoin</strong><br>
+  <strong>Trustless P2P Atomic Swaps — Bitcoin, Fractal Bitcoin, Litecoin, Bellscoin</strong><br>
   Using Discreet Log Contracts (DLCs) with Adaptor Signatures on Taproot
 </p>
 
-<table align="center" border="0" cellspacing="0" cellpadding="0">
+<table align="center" border="0" cellspacing="0" cellpadding="8">
   <tr>
-    <td align="center" width="120">
-      <img src="https://upload.wikimedia.org/wikipedia/commons/4/46/Bitcoin.svg" width="36" alt="Bitcoin"><br>
-      <strong>Bitcoin</strong>
+    <td align="center" width="100">
+      <img src="https://upload.wikimedia.org/wikipedia/commons/4/46/Bitcoin.svg" width="32" height="32" alt="Bitcoin"><br>
+      <strong>Bitcoin</strong><br><small>BTC</small>
     </td>
-    <td align="center" width="80">
-      <code>&nbsp;⟶&nbsp;</code><br>
-      <code>&nbsp;⟵&nbsp;</code>
+    <td align="center" width="100">
+      <img src="https://next-cdn.unisat.space/_/2025-v2107/img/icon/fractal-mainnet.svg" width="32" height="32" alt="Fractal Bitcoin"><br>
+      <strong>Fractal Bitcoin</strong><br><small>FB</small>
     </td>
-    <td align="center" width="120">
-      <img src="https://next-cdn.unisat.space/_/2025-v2107/img/icon/fractal-mainnet.svg" width="36" alt="Fractal Bitcoin"><br>
-      <strong>Fractal Bitcoin</strong>
+    <td align="center" width="100">
+      <img src="https://cryptologos.cc/logos/litecoin-ltc-logo.svg" width="32" height="32" alt="Litecoin"><br>
+      <strong>Litecoin</strong><br><small>LTC</small>
+    </td>
+    <td align="center" width="100">
+      <img src="https://raw.githubusercontent.com/bellscoin/bellscoin/master/src/qt/res/icons/bitcoin.png" width="32" height="32" alt="Bellscoin"><br>
+      <strong>Bellscoin</strong><br><small>BEL</small>
     </td>
   </tr>
 </table>
@@ -88,12 +92,13 @@ The entire flow is coordinated through PSBTs (Partially Signed Bitcoin Transacti
 - [Configuration Parameters](#configuration-parameters)
 - [BIP Compliance](#bip-compliance)
 - [License](#license)
+- [What to do next — grants and using the MVP](#what-to-do-next--grants-and-using-the-mvp)
 
 ---
 
 ## Overview
 
-NexumBit is a **fully non-custodial, peer-to-peer bridge** between **Bitcoin (BTC)** and **Fractal Bitcoin (FB)** — two architecturally identical but independent blockchains.
+NexumBit is a **fully non-custodial, peer-to-peer bridge** supporting **Bitcoin (BTC)**, **Fractal Bitcoin (FB)**, **Litecoin (LTC)**, and **Bellscoin (BEL)** — Taproot-capable chains with a shared script model.
 
 The protocol uses **Discreet Log Contracts (DLCs)** built on **Taproot (P2TR)** outputs with **adaptor signatures** to achieve atomic cross-chain swaps. At no point does any third party hold user funds. The NexumBit backend acts solely as a **matchmaker and PSBT builder** — all value transfer happens on-chain, verified by Bitcoin Script.
 
@@ -618,12 +623,35 @@ The Claim PSBTs contains the adaptor signature pre-embedded in `taproot_sigs`. T
 
 ## License
 
-This protocol specification and the NexumBit implementation are released as **open source**. The cryptographic constructions, script templates, and swap flow described herein are available for anyone to implement, audit, or build upon.
+This protocol specification and the open-source DLC builder are released under the **MIT License**:
 
-The protocol is based on well-established Bitcoin primitives (Taproot, Schnorr signatures, CLTV timelocks) and does not rely on any proprietary or patented technology.
+```
+Copyright (c) 2024–2025 NexumBit contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+The protocol is based on well-established Bitcoin primitives (Taproot, Schnorr signatures, CLTV timelocks) and does not rely on any proprietary or patented technology. Chain logos in this document are used for identification; see each project’s terms for logo usage (Bitcoin, Litecoin, Fractal Bitcoin, Bellscoin/Nintondo).
 
 ---
 
+
 <p align="center">
-  <sub>Built with Taproot & Adaptor Signatures · Powered by Bitcoin Script</sub>
+  <sub>Built in Solitude · Powered by Bitcoin Script</sub>
 </p>
