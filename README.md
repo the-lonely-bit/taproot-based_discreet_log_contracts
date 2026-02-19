@@ -36,7 +36,7 @@
 
 ### Why
 
-Bitcoin and Fractal Bitcoin share the same architecture, the same scripting language, and the same UTXO model — yet moving value between them today requires trusting a centralized bridge with your funds. Wrapped tokens introduce counterparty risk. Centralized exchanges add KYC friction, withdrawal delays, and custodial exposure. Users deserve a way to swap BTC ↔ FB that is as trustless as Bitcoin itself.
+Bitcoin and Fractal Bitcoin and few other bitcoin forks, share the same architecture, the same scripting language, and the same UTXO model — yet moving value between them today requires trusting a centralized bridge with your funds. Wrapped tokens introduce counterparty risk. Centralized exchanges add KYC friction, withdrawal delays, and custodial exposure. Users deserve a way to swap BTC ↔ FB that is as trustless as Bitcoin itself.
 
 NexumBit exists because **cross-chain swaps should not require trust**.
 
