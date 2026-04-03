@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://zerobit.thelonelybit.org/nexumbit-logo.svg" width="72" height="72" alt="NexumBit Logo">
+  <img src="https://bridge.thelonelybit.org/nexumbit-logo.svg" width="72" height="72" alt="NexumBit Logo">
 </p>
 
 <h1 align="center">NexumBit Protocol</h1>
