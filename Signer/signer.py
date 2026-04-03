@@ -10,12 +10,14 @@ Two modes:
   [2] Build + Sign from Recovery Kit (JSON file or paste)
 
 Supports:
-  - Taproot script-path claim (with pre-signed or manual adaptor signature)
-  - Taproot script-path refund (timeout + sender key)
+  - Taproot script-path claim (pre-signed or manual adaptor signature; same shape as oracle co-sign + lender)
+  - FAL hashlock lender claim (OP_SHA256 preimage + lender Schnorr — mode [1] prompts for 32-byte preimage)
+  - Taproot script-path refund (CLTV + single key), including fixed-term lender leaf and safety refund
   - Private key input: WIF or raw 64-char hex
-  - Broadcasting to Bitcoin / Fractal Bitcoin networks
+  - Broadcasting to Bitcoin / Fractal Bitcoin / Litecoin / Bellscoin / DigiByte / Groestlcoin networks
 
 Dependencies: pip install embit base58 httpx
+  - segwit_addr.py (bundled): DGB/GRS/LTC/BEL address support (dgb1, grs1, ltc1, bel1)
   - embit:  Required (Schnorr signatures, key derivation)
   - base58: Required (WIF decoding)
   - httpx:  Optional (broadcasting — can broadcast manually without it)
@@ -28,6 +30,7 @@ import os
 import json
 import hashlib
 import struct
+import base64
 from io import BytesIO
 from typing import Optional, Tuple, Dict, List, Any
 
@@ -50,6 +53,21 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
+# Local segwit_addr for DGB/GRS/LTC/BEL (dgb1, grs1, ltc1, bel1) — always available
+try:
+    from segwit_addr import decode as segwit_decode
+    HAS_SEGWIT_ADDR = True
+except ImportError:
+    # Allow running from project root: python psbt-signer/signer.py
+    _signer_dir = os.path.dirname(os.path.abspath(__file__))
+    if _signer_dir not in sys.path:
+        sys.path.insert(0, _signer_dir)
+    try:
+        from segwit_addr import decode as segwit_decode
+        HAS_SEGWIT_ADDR = True
+    except ImportError:
+        HAS_SEGWIT_ADDR = False
+
 
 # ═══════════════════════════════════════════════════════════════
 # Constants
@@ -69,6 +87,35 @@ NETWORKS = {
         "broadcast_url": "https://mempool.fractalbitcoin.io/api/tx",
         "tx_url": "https://mempool.fractalbitcoin.io/tx/",
         "height_url": "https://mempool.fractalbitcoin.io/api/blocks/tip/height",
+    },
+    "ltc": {
+        "name": "Litecoin",
+        "broadcast_url": "https://litecoinspace.org/api/tx",
+        "tx_url": "https://litecoinspace.org/tx/",
+        "height_url": "https://litecoinspace.org/api/blocks/tip/height",
+    },
+    "bel": {
+        "name": "Bellscoin",
+        "broadcast_url": "https://nintondo.io/api/electrs/tx",
+        "tx_url": "https://nintondo.io/bells/mainnet/explorer/tx/",
+        "height_url": "https://nintondo.io/api/electrs/blocks/tip/height",
+    },
+    "dgb": {
+        "name": "DigiByte",
+        # Blockbook uses /api/v2/sendtx/ (not /api/tx); returns JSON {"result":"<txid>"}
+        "broadcast_url": "https://digibyte.atomicwallet.io/api/v2/sendtx/",
+        "broadcast_urls": ["https://digibyte.atomicwallet.io/api/v2/sendtx/"],
+        "tx_url": "https://digibyte.atomicwallet.io/tx/",
+        "height_url": "https://digibyte.atomicwallet.io/api/v2",
+        "height_json": True,  # Blockbook: parse blockbook.bestHeight from JSON
+    },
+    "grs": {
+        "name": "Groestlcoin",
+        "broadcast_url": "https://blockbook.groestlcoin.org/api/v2/sendtx/",
+        "broadcast_urls": ["https://blockbook.groestlcoin.org/api/v2/sendtx/"],
+        "tx_url": "https://blockbook.groestlcoin.org/tx/",
+        "height_url": "https://blockbook.groestlcoin.org/api/v2",
+        "height_json": True,
     },
 }
 
@@ -116,8 +163,33 @@ def tap_tweak(internal_key: bytes, merkle_root: bytes) -> bytes:
 
 
 def address_to_scriptpubkey(addr: str) -> bytes:
-    """Convert a Bitcoin/Fractal address to raw scriptpubkey bytes (using embit)."""
-    return embit_script.address_to_scriptpubkey(addr).data
+    """
+    Convert address to raw scriptpubkey bytes.
+    Supports: bc1, tb1 (embit), dgb1, grs1, ltc1, bel1 (segwit_addr for Taproot).
+    """
+    addr_lower = addr.strip().lower()
+    # Alt-chain bech32m (dgb1, grs1, ltc1, bel1)
+    if HAS_SEGWIT_ADDR:
+        for hrp in ("dgb", "grs", "ltc", "bel"):
+            if addr_lower.startswith(hrp + "1"):
+                try:
+                    ver, prog = segwit_decode(hrp, addr)
+                    if ver == 1 and prog and len(prog) == 32:  # Taproot
+                        return bytes([0x51, 0x20]) + bytes(prog)
+                    if ver == 0 and prog and len(prog) in (20, 32):  # v0 segwit
+                        return bytes([0x00, len(prog)]) + bytes(prog)
+                except Exception:
+                    pass
+    # Bitcoin/Fractal (bc1, tb1) — use embit
+    try:
+        return embit_script.address_to_scriptpubkey(addr).data
+    except Exception:
+        if addr_lower.startswith(("dgb1", "grs1", "ltc1", "bel1")):
+            raise ValueError(
+                f"DGB/GRS/LTC/BEL address detected but segwit_addr module not found. "
+                f"Ensure segwit_addr.py is in the same directory as signer.py."
+            ) from None
+        raise
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -125,7 +197,10 @@ def address_to_scriptpubkey(addr: str) -> bytes:
 # ═══════════════════════════════════════════════════════════════
 
 def decode_wif(wif: str) -> Tuple[bytes, bool]:
-    """Decode WIF to (32-byte secret, compressed)."""
+    """
+    Decode WIF to (32-byte secret, compressed).
+    Supports: Bitcoin/FB mainnet (0x80), testnet (0xEF), DGB/GRS mainnet (0x80).
+    """
     raw = base58.b58decode_check(wif)
     if raw[0] in (0x80, 0xEF):
         if len(raw) == 34 and raw[-1] == 0x01: return raw[1:33], True
@@ -159,6 +234,169 @@ def parse_private_key(key_input: str) -> Tuple[bytes, bytes]:
             pass
 
     raise ValueError("Invalid key. Provide WIF (starts with K/L/5) or 64-char raw hex.")
+
+
+def derive_btc_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From BTC private key (WIF or 64-char hex), derive Taproot address and pubkeys.
+
+    Returns:
+        (address bc1p..., xonly 64 hex, compressed 66 hex)
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for BTC derivation")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    try:
+        from embit import bech32
+        address = bech32.encode("bc", 1, output_xonly)
+    except ImportError:
+        address = None
+    if address is None:
+        raise ValueError("Could not encode BTC address (embit.bech32 required)")
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
+
+
+def derive_fb_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From Fractal Bitcoin private key (WIF or 64-char hex), derive Taproot address and pubkeys.
+    FB shares the bc1p HRP with mainnet Bitcoin.
+
+    Returns:
+        (address bc1p..., xonly 64 hex, compressed 66 hex)
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for FB derivation")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    try:
+        from embit import bech32
+        address = bech32.encode("bc", 1, output_xonly)
+    except ImportError:
+        address = None
+    if address is None:
+        raise ValueError("Could not encode FB address (embit.bech32 required)")
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
+
+
+def derive_dgb_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From DGB private key (WIF or 64-char hex), derive the Taproot address and pubkey.
+
+    Returns:
+        (address, pubkey_xonly_hex, pubkey_compressed_hex)
+        - address: dgb1p... Taproot address
+        - pubkey_xonly_hex: 64-char hex (x-only, for DLC user_refund_xonly etc.)
+        - pubkey_compressed_hex: 66-char hex (02/03 + x-only, for compatibility)
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for DGB derivation")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    try:
+        from embit import bech32
+        address = bech32.encode("dgb", 1, output_xonly)
+    except ImportError:
+        address = None
+    if address is None:
+        raise ValueError("Could not encode DGB address (embit.bech32 required)")
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
+
+
+def derive_grs_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From GRS private key (WIF or 64-char hex), derive the Taproot address and pubkey.
+
+    Returns:
+        (address, pubkey_xonly_hex, pubkey_compressed_hex)
+        - address: grs1p... Taproot address
+        - pubkey_xonly_hex: 64-char hex
+        - pubkey_compressed_hex: 66-char hex
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for GRS derivation")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    try:
+        from embit import bech32
+        address = bech32.encode("grs", 1, output_xonly)
+    except ImportError:
+        address = None
+    if address is None:
+        raise ValueError("Could not encode GRS address (embit.bech32 required)")
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
+
+
+def derive_ltc_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From LTC private key (WIF or 64-char hex), derive Taproot address and pubkeys.
+
+    Returns:
+        (address ltc1p..., xonly 64 hex, compressed 66 hex)
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for LTC derivation")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    try:
+        from embit import bech32
+        address = bech32.encode("ltc", 1, output_xonly)
+    except ImportError:
+        address = None
+    if address is None:
+        raise ValueError("Could not encode LTC address (embit.bech32 required)")
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
+
+
+def derive_bel_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From Bellscoin private key (WIF or 64-char hex), derive Taproot address and pubkeys.
+
+    Returns:
+        (address bel1p..., xonly 64 hex, compressed 66 hex)
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for BEL derivation")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    try:
+        from embit import bech32
+        address = bech32.encode("bel", 1, output_xonly)
+    except ImportError:
+        address = None
+    if address is None:
+        raise ValueError("Could not encode BEL address (embit.bech32 required)")
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -391,8 +629,19 @@ def verify_leaf(pinp: PInput, cb: bytes, script: bytes, leaf_ver: int) -> bool:
 
 def analyze_script(script: bytes) -> Dict[str, Any]:
     """Determine whether a tapscript is a claim or refund path and extract keys."""
+    # FAL hashlock: OP_SHA256 <32 h> OP_EQUALVERIFY <32 lender> OP_CHECKSIG
+    #  A8 20...32 88 20...32 AC  (69 bytes)
+    if (len(script) == 69 and script[0] == 0xA8 and script[1] == 0x20
+            and script[34] == 0x88 and script[35] == 0x20 and script[68] == 0xAC):
+        return {
+            'type': 'lender_claim_hashlock',
+            'lender_pubkey': script[36:68],
+            'sigs_needed': 1,
+            'description': 'FAL lender claim: SHA256 preimage + lender key',
+        }
+
     # Success: <32> OP_CHECKSIGVERIFY <32> OP_CHECKSIG
-    #          20 <adaptor:32> AD 20 <receiver:32> AC
+    #          20 <adaptor|oracle:32> AD 20 <receiver|lender:32> AC
     if (len(script) == 68 and script[0] == 0x20 and script[33] == 0xAD
             and script[34] == 0x20 and script[67] == 0xAC):
         return {
@@ -400,7 +649,7 @@ def analyze_script(script: bytes) -> Dict[str, Any]:
             'adaptor_point': script[1:33],
             'receiver_pubkey': script[35:67],
             'sigs_needed': 2,
-            'description': 'Claim (success path): adaptor + receiver key',
+            'description': 'Claim (dual-sig path): co-sign + receiver key (swap adaptor or oracle)',
         }
 
     # Refund: <locktime_push> OP_CLTV OP_DROP <32> OP_CHECKSIG
@@ -490,10 +739,66 @@ def schnorr_sign(privkey_bytes: bytes, msg: bytes) -> bytes:
     return sig.serialize() if hasattr(sig, 'serialize') else bytes(sig)
 
 
+def bip322_hash(message: str) -> bytes:
+    """BIP-322 signed message hash (tagged SHA256)."""
+    tag = b"BIP0322-signed-message"
+    tag_hash = hashlib.sha256(tag).digest()
+    msg_bytes = message.encode("utf-8")
+    return hashlib.sha256(tag_hash + tag_hash + msg_bytes).digest()
+
+
+def sign_bip322_message(message: str, key_bytes: bytes, scriptpubkey: bytes) -> str:
+    """
+    Sign a BIP-322 simple message for Taproot (P2TR) address.
+    Returns base64-encoded signature suitable for verify_bip322.
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for BIP-322 signing")
+    if len(scriptpubkey) != 34 or scriptpubkey[0] != 0x51 or scriptpubkey[1] != 0x20:
+        raise ValueError("BIP-322 sign supports Taproot (P2TR) only")
+    output_xonly = scriptpubkey[2:]
+    pk = PrivateKey(key_bytes)
+    output_key = pk.get_public_key().taproot_tweak(b"")
+    if output_key.xonly() != output_xonly:
+        raise ValueError("Key does not match address")
+    pk_tweaked = pk.taproot_tweak(b"")
+    msg_hash = bip322_hash(message)
+    # to_spend: version 0, input with scriptSig 0x0020||msg_hash, output to scriptpubkey
+    prevout = bytes(32)
+    prevout_idx = 0xFFFFFFFF
+    script_sig = bytes([0x00, 0x20]) + msg_hash
+    tx_to_spend = Tx()
+    tx_to_spend.version = 0
+    tx_to_spend.ins = [TxIn(prevout, prevout_idx, script_sig, 0)]
+    tx_to_spend.outs = [TxOut(0, scriptpubkey)]
+    tx_to_spend.locktime = 0
+    tx_to_spend_raw = tx_to_spend.raw()
+    txid_spend = hashlib.sha256(hashlib.sha256(tx_to_spend_raw).digest()).digest()[::-1]
+    # to_sign: input from txid_spend:0, witness_utxo = scriptpubkey
+    from embit.script import Script
+    from embit.transaction import Transaction, TransactionInput, TransactionOutput
+    from embit.transaction import SIGHASH
+    spk_script = Script(scriptpubkey)
+    op_return_script = Script(bytes.fromhex("6a"))
+    inp = TransactionInput(txid_spend, 0, embit_script.Script(b""), 0)
+    out = TransactionOutput(0, op_return_script)
+    embit_tx = Transaction(version=0, vin=[inp], vout=[out], locktime=0)
+    sighash = embit_tx.sighash_taproot(0, [spk_script], [0], sighash=SIGHASH.DEFAULT)
+    sig = schnorr_sign(pk_tweaked.secret, sighash)
+    # Encode witness: BIP-322 simple = [schnorr_64]
+    witness = [sig]
+    encoded = write_compact(len(witness))
+    for w in witness:
+        encoded += write_compact(len(w)) + w
+    return base64.b64encode(encoded).decode("ascii")
+
+
 def sign_and_finalize(psbt_hex: str, key_bytes: bytes,
-                      adaptor_key_bytes: Optional[bytes] = None) -> Tuple[Optional[str], str]:
+                      adaptor_key_bytes: Optional[bytes] = None,
+                      preimage: Optional[bytes] = None) -> Tuple[Optional[str], str]:
     """
     Sign a PSBT and finalize it into a raw transaction.
+    For FAL hashlock lender claims, pass the 32-byte attestation preimage as ``preimage``.
     Returns (raw_tx_hex, txid) on success, or (None, error_msg).
     """
     tx, inputs = parse_psbt(bytes.fromhex(psbt_hex))
@@ -525,8 +830,8 @@ def sign_and_finalize(psbt_hex: str, key_bytes: bytes,
                 pre_sig = pinp.tap_script_sigs.get((adaptor_point, lh))
 
                 if pre_sig:
-                    # Pre-signed adaptor: user only provides their receiver key
-                    print(f"    ✓ Pre-signed adaptor sig found ({pre_sig.hex()[:24]}…)")
+                    # Pre-signed second key (adaptor or oracle): user only signs as receiver/lender
+                    print(f"    ✓ Pre-signed co-signature found ({pre_sig.hex()[:24]}…)")
                     if my_xonly != info['receiver_pubkey']:
                         return None, (f"Receiver key mismatch: script expects "
                                       f"{info['receiver_pubkey'].hex()[:16]}…, "
@@ -535,7 +840,7 @@ def sign_and_finalize(psbt_hex: str, key_bytes: bytes,
                     print(f"    sig_receiver: {sig_receiver.hex()[:24]}…")
                     witnesses[idx] = [sig_receiver, pre_sig, script, cb]
                     signed += 1
-                    print(f"  ✓ Input {idx}: claim signed (pre-signed adaptor + receiver)")
+                    print(f"  ✓ Input {idx}: claim signed (pre-signed co-sig + receiver/lender)")
                     break
 
                 # Manual adaptor signing
@@ -556,6 +861,25 @@ def sign_and_finalize(psbt_hex: str, key_bytes: bytes,
                 witnesses[idx] = [sig_receiver, sig_adaptor, script, cb]
                 signed += 1
                 print(f"  ✓ Input {idx}: claim signed (adaptor + receiver)")
+                break
+
+            elif info['type'] == 'lender_claim_hashlock':
+                if not preimage or len(preimage) != 32:
+                    return None, (
+                        "32-byte attestation preimage required for FAL hashlock claim "
+                        "(use attestation_preimage_hex from the API / UI)"
+                    )
+                if my_xonly != info['lender_pubkey']:
+                    return None, (
+                        f"Lender key mismatch: script expects {info['lender_pubkey'].hex()[:16]}…, "
+                        f"your key is {my_xonly.hex()[:16]}…"
+                    )
+                sig_lender = schnorr_sign(key_bytes, msg)
+                print(f"    sig_lender: {sig_lender.hex()[:24]}…")
+                # Witness (bottom→top): lender_sig, preimage, script, control block
+                witnesses[idx] = [sig_lender, preimage, script, cb]
+                signed += 1
+                print(f"  ✓ Input {idx}: FAL hashlock claim signed (preimage + lender)")
                 break
 
             elif info['type'] == 'refund':
@@ -741,20 +1065,58 @@ def build_claim_psbt(kit: Dict, fee_rate: int = DEFAULT_FEE_RATE) -> Tuple[str, 
 # Network helpers
 # ═══════════════════════════════════════════════════════════════
 
-def broadcast(raw_hex: str, network: str) -> str:
-    """Broadcast a raw transaction. Returns txid on success."""
-    url = NETWORKS[network]["broadcast_url"]
+def _broadcast_one(raw_hex: str, url: str) -> str:
+    """Broadcast to a single URL. Returns txid on success."""
     r = httpx.post(url, content=raw_hex, headers={"Content-Type": "text/plain"}, timeout=30)
     if r.status_code == 200:
-        return r.text.strip()
+        # Blockbook /api/v2/sendtx/ returns JSON {"result":"<txid>"}; mempool returns plain txid
+        body = r.text.strip()
+        if body.startswith("{"):
+            try:
+                j = r.json()
+                return (j.get("result") or j.get("txid") or "").strip()
+            except Exception:
+                pass
+        return body
     raise RuntimeError(f"Broadcast failed ({r.status_code}): {r.text}")
+
+
+def broadcast(raw_hex: str, network: str) -> str:
+    """Broadcast a raw transaction. Returns txid on success."""
+    cfg = NETWORKS[network]
+    urls = cfg.get("broadcast_urls") or [cfg["broadcast_url"]]
+    # Allow env override for DGB (Atomic may reject Taproot)
+    if network == "dgb" and os.environ.get("DGB_BROADCAST_URL"):
+        urls = [os.environ["DGB_BROADCAST_URL"]] + [u for u in urls if u != os.environ["DGB_BROADCAST_URL"]]
+    if network == "grs" and os.environ.get("GRS_BROADCAST_URL"):
+        urls = [os.environ["GRS_BROADCAST_URL"]] + [u for u in urls if u != os.environ["GRS_BROADCAST_URL"]]
+    if network == "bel" and os.environ.get("BEL_BROADCAST_URL"):
+        urls = [os.environ["BEL_BROADCAST_URL"]] + [u for u in urls if u != os.environ["BEL_BROADCAST_URL"]]
+    if network == "ltc" and os.environ.get("LTC_BROADCAST_URL"):
+        urls = [os.environ["LTC_BROADCAST_URL"]] + [u for u in urls if u != os.environ["LTC_BROADCAST_URL"]]
+    last_err = None
+    for url in urls:
+        try:
+            return _broadcast_one(raw_hex, url)
+        except Exception as e:
+            err_str = str(e)
+            last_err = e
+            # Taproot rejection: try next endpoint
+            if "soft-fork" in err_str or "Witness version reserved" in err_str or "code 64" in err_str:
+                continue
+            raise
+    raise last_err or RuntimeError("Broadcast failed")
 
 
 def get_block_height(network: str) -> Optional[int]:
     """Fetch current block height. Returns None on failure."""
     try:
-        r = httpx.get(NETWORKS[network]["height_url"], timeout=10)
+        cfg = NETWORKS[network]
+        r = httpx.get(cfg["height_url"], timeout=10)
         if r.status_code == 200:
+            if cfg.get("height_json"):
+                data = r.json()
+                return int(data.get("blockbook", {}).get("bestHeight", 0))
             return int(r.text.strip())
     except Exception:
         pass
@@ -774,7 +1136,18 @@ def _do_broadcast(raw_hex: str, net: str):
         print(f"    View: {NETWORKS[net]['tx_url']}{txid}")
     except Exception as e:
         print(f"\n  ✗ {e}")
-        print(f"    Broadcast manually: POST raw hex to {NETWORKS[net]['broadcast_url']}")
+        urls = NETWORKS[net].get("broadcast_urls") or [NETWORKS[net]["broadcast_url"]]
+        print(f"    Broadcast manually:")
+        for u in urls[:3]:
+            print(f"      curl -X POST {u} -d '<raw_hex>'")
+        if net == "dgb":
+            print(f"    Or set DGB_BROADCAST_URL to a Taproot-supporting endpoint (DigiByte Core 8.23+)")
+        if net == "grs":
+            print(f"    Or set GRS_BROADCAST_URL to a Taproot-supporting endpoint")
+        if net == "bel":
+            print(f"    Or set BEL_BROADCAST_URL to another electrs-compatible /tx endpoint")
+        if net == "ltc":
+            print(f"    Or set LTC_BROADCAST_URL to another mempool-style /tx endpoint")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -784,7 +1157,7 @@ def _do_broadcast(raw_hex: str, net: str):
 def mode_sign_psbt():
     """Interactive: sign an existing PSBT from hex."""
     # Network
-    print("\n[1] Network (btc / fb):")
+    print("\n[1] Network (btc / fb / ltc / bel / dgb / grs):")
     net = input("    > ").strip().lower()
     if net not in NETWORKS:
         print(f"  ✗ Unknown network '{net}'"); return
@@ -804,14 +1177,17 @@ def mode_sign_psbt():
     # Analyze scripts
     needs_adaptor = False
     has_pre_signed = False
+    needs_preimage = False
     for idx, pinp in enumerate(inputs):
         for cb, script_data, leaf_ver in pinp.leaves:
             info = analyze_script(script_data)
             print(f"    Input {idx}: {pinp.utxo_value:,} sats — {info['description']}")
+            if info['type'] == 'lender_claim_hashlock':
+                needs_preimage = True
             if info['type'] == 'claim':
                 lh = tap_leaf_hash(script_data, leaf_ver)
                 if pinp.tap_script_sigs.get((info['adaptor_point'], lh)):
-                    print(f"    ✓ Adaptor sig pre-embedded (no adaptor secret needed)")
+                    print(f"    ✓ Co-signature pre-embedded (no adaptor secret needed)")
                     has_pre_signed = True
                 else:
                     needs_adaptor = True
@@ -825,9 +1201,24 @@ def mode_sign_psbt():
     except Exception as e:
         print(f"  ✗ {e}"); return
 
-    # Adaptor secret (only if needed and not pre-signed)
     adaptor_bytes = None
+    preimage_bytes = None
     step = 4
+
+    # FAL hashlock: 32-byte preimage (64 hex chars)
+    if needs_preimage:
+        print(f"\n[{step}] FAL attestation preimage (64 hex chars = 32 bytes):")
+        ph = input("    > ").strip()
+        if not ph or len(ph) != 64:
+            print("  ✗ Must be 64 hex chars"); return
+        try:
+            preimage_bytes = bytes.fromhex(ph)
+            print(f"    ✓ preimage (first bytes): {preimage_bytes.hex()[:16]}…")
+        except Exception as e:
+            print(f"  ✗ Invalid: {e}"); return
+        step += 1
+
+    # Adaptor secret (only if needed and not pre-signed)
     if needs_adaptor and not has_pre_signed:
         print(f"\n[{step}] Adaptor secret (64-char hex):")
         ah = input("    > ").strip()
@@ -841,11 +1232,11 @@ def mode_sign_psbt():
             print(f"  ✗ Invalid: {e}"); return
         step += 1
     elif has_pre_signed:
-        print(f"\n    ℹ Adaptor sig pre-embedded — no adaptor secret needed")
+        print(f"\n    ℹ Co-signature pre-embedded — no adaptor secret needed")
 
     # Sign
     print(f"\n[{step}] Signing…")
-    raw_hex, result = sign_and_finalize(psbt_hex, key_bytes, adaptor_bytes)
+    raw_hex, result = sign_and_finalize(psbt_hex, key_bytes, adaptor_bytes, preimage_bytes)
     if not raw_hex:
         print(f"\n  ✗ Failed: {result}"); return
 
@@ -1139,11 +1530,206 @@ def _sign_and_broadcast(psbt_hex: str, net: str, action_type: str):
 # Main
 # ═══════════════════════════════════════════════════════════════
 
+def mode_sign_bip322():
+    """Sign a BIP-322 message for Taproot (P2TR) address. Usage: python signer.py sign-bip322 <message>"""
+    if len(sys.argv) < 3:
+        print("Usage: python signer.py sign-bip322 <message>")
+        print("  Message is the exact string to sign (e.g. addrFrom|addrTo|hCommit|ts)")
+        sys.exit(1)
+    message = " ".join(sys.argv[2:])  # Allow message with spaces
+    print(f"\n  BIP-322 sign mode")
+    print(f"  Message ({len(message)} chars): {message[:60]}{'…' if len(message) > 60 else ''}")
+    print(f"\n  Taproot address (dgb1... / grs1... / ltc1... / bel1... / bc1p...):")
+    addr = input("    > ").strip()
+    print(f"\n  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        scriptpubkey = address_to_scriptpubkey(addr)
+    except Exception as e:
+        print(f"  ✗ Invalid address: {e}")
+        sys.exit(1)
+    try:
+        key_bytes, _ = parse_private_key(key_input)
+    except Exception as e:
+        print(f"  ✗ Invalid key: {e}")
+        sys.exit(1)
+    try:
+        sig_b64 = sign_bip322_message(message, key_bytes, scriptpubkey)
+        print(f"\n  Signature (base64):")
+        print(sig_b64)
+    except Exception as e:
+        print(f"  ✗ Sign failed: {e}")
+        sys.exit(1)
+
+
+def mode_derive_btc():
+    """Derive BTC Taproot address from private key. Usage: python signer.py derive-btc"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    print("\n  Derive BTC (Taproot) address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_btc_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
+def mode_derive_fb():
+    """Derive Fractal Bitcoin Taproot address from private key. Usage: python signer.py derive-fb"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    print("\n  Derive FB (Fractal Bitcoin Taproot) address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_fb_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
+def mode_derive_dgb():
+    """Derive DGB address and pubkey from private key. Usage: python signer.py derive-dgb"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    print("\n  Derive DGB address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_dgb_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
+def mode_derive_grs():
+    """Derive GRS address and pubkey from private key. Usage: python signer.py derive-grs"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    print("\n  Derive GRS address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_grs_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
+def mode_derive_ltc():
+    """Derive LTC Taproot address from private key. Usage: python signer.py derive-ltc"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    print("\n  Derive LTC (Taproot) address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_ltc_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
+def mode_derive_bel():
+    """Derive BEL Taproot address from private key. Usage: python signer.py derive-bel"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    print("\n  Derive Bellscoin (Taproot) address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_bel_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
 def main():
+    # CLI mode: python signer.py derive-btc / derive-fb / derive-dgb / etc.
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-btc":
+        mode_derive_btc()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-fb":
+        mode_derive_fb()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-dgb":
+        mode_derive_dgb()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-grs":
+        mode_derive_grs()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-ltc":
+        mode_derive_ltc()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-bel":
+        mode_derive_bel()
+        return
+    # CLI mode: python signer.py sign-bip322 <message>
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "sign-bip322":
+        if not HAS_EMBIT:
+            print("✗ embit required: pip install embit")
+            sys.exit(1)
+        if not HAS_BASE58:
+            print("✗ base58 required: pip install base58")
+            sys.exit(1)
+        mode_sign_bip322()
+        return
+
     print(f"\n{'═' * 60}")
     print(f"  NexumBit Recovery & Signing Tool v{VERSION}")
     print(f"  Self-sovereign recovery for DLC bridge swaps")
+    print(f"  + Cross-Chain DLC Lending PSBTs")
     print(f"{'═' * 60}")
+    print(f"\n  Lending PSBT types (use mode [1] to sign):")
+    print(f"    - repay          : Borrower reclaims collateral after repayment")
+    print(f"    - lender-claim   : Oracle mode — co-sig in PSBT; you sign as lender")
+    print(f"    - FAL hashlock   : Fractal attestation — paste 32-byte preimage when prompted")
+    print(f"    - fixed-term     : CLTV lender leaf — signer uses refund-style path; respect nLockTime")
+    print(f"    - safety-refund  : Borrower emergency exit after long timeout")
 
     if not HAS_EMBIT:
         print("\n  ✗ embit required: pip install embit"); sys.exit(1)
@@ -1155,12 +1741,34 @@ def main():
     print("\n  Select mode:")
     print("    [1] Sign existing PSBT (hex)")
     print("    [2] Recover from Recovery Kit (JSON)")
+    print("    [3] Sign BIP-322 message (quotes)")
+    print("    [4] Derive BTC Taproot address from private key")
+    print("    [5] Derive FB  Taproot address from private key")
+    print("    [6] Derive DGB Taproot address from private key")
+    print("    [7] Derive GRS Taproot address from private key")
+    print("    [8] Derive LTC Taproot address from private key")
+    print("    [9] Derive BEL Taproot address from private key")
 
     mode = input("\n  > ").strip()
     if mode == '1':
         mode_sign_psbt()
     elif mode == '2':
         mode_recovery_kit()
+    elif mode == '3':
+        sys.argv = [sys.argv[0], "sign-bip322"] + [input("  Message to sign: ").strip()]
+        mode_sign_bip322()
+    elif mode == '4':
+        mode_derive_btc()
+    elif mode == '5':
+        mode_derive_fb()
+    elif mode == '6':
+        mode_derive_dgb()
+    elif mode == '7':
+        mode_derive_grs()
+    elif mode == '8':
+        mode_derive_ltc()
+    elif mode == '9':
+        mode_derive_bel()
     else:
         print(f"  ✗ Unknown mode '{mode}'")
 
