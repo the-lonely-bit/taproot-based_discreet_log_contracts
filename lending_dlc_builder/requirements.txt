@@ -1,0 +1,4 @@
+# Peer of dlc_builder/requirements.txt — install embit for Taproot + scripts
+embit>=0.7.0
+# Optional: faster secp256k1 for internal key derivation
+# coincurve>=18.0.0
