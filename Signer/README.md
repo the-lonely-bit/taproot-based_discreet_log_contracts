@@ -2,7 +2,6 @@
 
 Standalone, self-sovereign tool for signing transactions/recovering funds from NexumBit **DLC bridge swaps** and **cross-chain lending**. **without** relying on the NexumBit backend — and for signing PSBTs.
 
-This README matches **`signer.py` v2.x** (see the module docstring and `VERSION` in code for the exact build).
 
 ## When You Need This
 - You prefer the External signing option.
