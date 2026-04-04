@@ -4,27 +4,24 @@
 
 <h1 align="center">NexumBit Protocol</h1>
 <p align="center">
-  <strong>Trustless P2P Atomic Swaps — Bitcoin, Fractal Bitcoin, Litecoin, Bellscoin</strong><br>
-  Using Discreet Log Contracts (DLCs) with Adaptor Signatures on Taproot
+  <strong>Taproot-native cross-chain atomic swaps</strong><br>
+  <strong>Bitcoin ↔ Fractal Bitcoin</strong> (primary pair in this specification)<br>
+  Discreet Log Contracts (DLCs) with adaptor signatures on P2TR
 </p>
 
-<table align="center" border="0" cellspacing="0" cellpadding="8">
+<table align="center" border="0" cellspacing="0" cellpadding="0">
   <tr>
-    <td align="center" width="100">
-      <img src="https://upload.wikimedia.org/wikipedia/commons/4/46/Bitcoin.svg" width="32" height="32" alt="Bitcoin"><br>
-      <strong>Bitcoin</strong><br><small>BTC</small>
+    <td align="center" width="120">
+      <img src="https://upload.wikimedia.org/wikipedia/commons/4/46/Bitcoin.svg" width="36" alt="Bitcoin"><br>
+      <strong>Bitcoin</strong>
     </td>
-    <td align="center" width="100">
-      <img src="https://next-cdn.unisat.space/_/2025-v2107/img/icon/fractal-mainnet.svg" width="32" height="32" alt="Fractal Bitcoin"><br>
-      <strong>Fractal Bitcoin</strong><br><small>FB</small>
+    <td align="center" width="80">
+      <code>&nbsp;⟶&nbsp;</code><br>
+      <code>&nbsp;⟵&nbsp;</code>
     </td>
-    <td align="center" width="100">
-      <img src="https://cryptologos.cc/logos/litecoin-ltc-logo.svg" width="32" height="32" alt="Litecoin"><br>
-      <strong>Litecoin</strong><br><small>LTC</small>
-    </td>
-    <td align="center" width="100">
-      <img src="https://raw.githubusercontent.com/bellscoin/bellscoin/master/src/qt/res/icons/bitcoin.png" width="32" height="32" alt="Bellscoin"><br>
-      <strong>Bellscoin</strong><br><small>BEL</small>
+    <td align="center" width="120">
+      <img src="https://next-cdn.unisat.space/_/2025-v2107/img/icon/fractal-mainnet.svg" width="36" alt="Fractal Bitcoin"><br>
+      <strong>Fractal Bitcoin</strong>
     </td>
   </tr>
 </table>
@@ -33,10 +30,17 @@
   <code>Non-Custodial</code> · <code>Atomic</code> · <code>On-Chain Verified</code> · <code>Open Protocol</code>
 </p>
 
+<p align="center">
+  <sub><strong>Scope &amp; trust model:</strong> This document specifies the <strong>atomic swap</strong> leg. Swaps here are <strong>non-custodial</strong> (funds sit in on-chain Taproot outputs; the backend matches and builds PSBTs, it does not custody keys or balances) and <strong>atomic</strong> at the DLC layer. You still rely on the coordinator for correct matching and PSBT construction—replaceable, but not “zero trust.” <strong>Cross-chain lending</strong> is described in other docs: collateral and loan flows are also non-custodial at the UTXO level, but settlement can involve <strong>oracles, timelocks, or attestation modes</strong>—so the same “trustless” label does not apply uniformly; see the lending intro.</sub>
+</p>
+
+---
+
+## NexumBit
 
 ### Why
 
-Bitcoin and Fractal Bitcoin and few other bitcoin forks, share the same architecture, the same scripting language, and the same UTXO model — yet moving value between them today requires trusting a centralized bridge with your funds. Wrapped tokens introduce counterparty risk. Centralized exchanges add KYC friction, withdrawal delays, and custodial exposure. Users deserve a way to swap BTC ↔ FB that is as trustless as Bitcoin itself.
+Bitcoin and Fractal Bitcoin share the same architecture, the same scripting language, and the same UTXO model — yet moving value between them today requires trusting a centralized bridge with your funds. Wrapped tokens introduce counterparty risk. Centralized exchanges add KYC friction, withdrawal delays, and custodial exposure. Users deserve a way to swap BTC ↔ FB that is as trustless as Bitcoin itself.
 
 NexumBit exists because **cross-chain swaps should not require trust**.
 
@@ -46,7 +50,7 @@ NexumBit is a **non-custodial, peer-to-peer atomic swap protocol** purpose-built
 
 - **No wrapped tokens.** You send real BTC; you receive real FB (and vice versa).
 - **No custodian.** Funds are locked in on-chain Taproot contracts that only the rightful owner can spend.
-- **No trust.** Every rule — who can claim, when refunds unlock, how amounts are verified — is enforced by Bitcoin Script on both chains.
+- **Script-enforced rules.** Who can claim, when refunds unlock, and how paths behave are defined by Tapscript on each chain (the backend does not override on-chain semantics).
 - **No revealed secrets.** Unlike HTLC preimages, adaptor secrets never appear on-chain, preserving privacy.
 
 The backend serves as a **matchmaker and PSBT builder** — it pairs compatible orders, constructs the contracts, and pre-signs its part of the adaptor signatures. It never holds keys, never custodies funds, and can be replaced without affecting locked contracts.
@@ -63,10 +67,25 @@ The entire flow is coordinated through PSBTs (Partially Signed Bitcoin Transacti
 
 ---
 
+## See also
+
+Everything from [Overview](#overview) onward is the **Bitcoin ↔ Fractal Bitcoin atomic swap** path: Taproot DLCs, adaptor binding, matching, timelocks, and recovery. For **cross-chain lending** (collateral + loan legs, lifecycle) and **offline PSBT signing**, use the companion material instead of expecting it here:
+
+- [`docs/DLC_LENDING_INTRO.md`](docs/DLC_LENDING_INTRO.md) — lending overview  
+- [`docs/DLC_LENDING_DEVELOPER_GUIDE.md`](docs/DLC_LENDING_DEVELOPER_GUIDE.md) — developer map  
+- [`nexum-open-source/lending_dlc_builder/`](nexum-open-source/lending_dlc_builder/) and [`WITNESS.md`](nexum-open-source/lending_dlc_builder/WITNESS.md) — collateral builders  
+- [`psbt-signer/README.md`](psbt-signer/README.md) — swap and lending PSBT signing  
+- [`nexum-open-source/WHAT_WE_RELEASE.md`](nexum-open-source/WHAT_WE_RELEASE.md) — what is published as open source  
+
+---
+
 ## Table of Contents
 
+- [NexumBit](#nexumbit)
+- [See also](#see-also)
 - [Overview](#overview)
 - [Architecture](#architecture)
+  - [Batch Matching (1↔1, 1↔N, N↔1, N↔M)](#batch-matching-11-1n-n1-nm)
 - [Protocol Flow](#protocol-flow)
   - [State Machine](#state-machine)
   - [Happy Path — Step by Step](#happy-path--step-by-step)
@@ -92,13 +111,12 @@ The entire flow is coordinated through PSBTs (Partially Signed Bitcoin Transacti
 - [Configuration Parameters](#configuration-parameters)
 - [BIP Compliance](#bip-compliance)
 - [License](#license)
-- [What to do next — grants and using the MVP](#what-to-do-next--grants-and-using-the-mvp)
 
 ---
 
 ## Overview
 
-NexumBit is a **fully non-custodial, peer-to-peer bridge** supporting **Bitcoin (BTC)**, **Fractal Bitcoin (FB)**, **Litecoin (LTC)**, and **Bellscoin (BEL)** — Taproot-capable chains with a shared script model.
+NexumBit is a **fully non-custodial, peer-to-peer bridge** between **Bitcoin (BTC)** and **Fractal Bitcoin (FB)** — two architecturally identical but independent blockchains.
 
 The protocol uses **Discreet Log Contracts (DLCs)** built on **Taproot (P2TR)** outputs with **adaptor signatures** to achieve atomic cross-chain swaps. At no point does any third party hold user funds. The NexumBit backend acts solely as a **matchmaker and PSBT builder** — all value transfer happens on-chain, verified by Bitcoin Script.
 
@@ -117,18 +135,18 @@ The protocol uses **Discreet Log Contracts (DLCs)** built on **Taproot (P2TR)** 
 ## Architecture
 
 ```
-┌──────────────────┐                     ┌──────────────────┐
-│    User A        │                     │    User B        │
-│  (sends BTC)     │                     │  (sends FB)      │
-│  UniSat Wallet   │                     │  UniSat Wallet   │
-└────────┬─────────┘                     └────────┬─────────┘
+┌──────────────────┐                    ┌──────────────────┐
+│    User A         │                    │    User B         │
+│  (sends BTC)      │                    │  (sends FB)       │
+│  UniSat Wallet    │                    │  UniSat Wallet    │
+└────────┬─────────┘                    └────────┬─────────┘
          │                                        │
          │  HTTPS/JSON                            │  HTTPS/JSON
          ▼                                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    NexumBit Backend                         │
+│                    NexumBit Backend                          │
 │                                                             │
-│  ┌─────────────┐   ┌──────────────┐  ┌────────────────────┐ │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐ │
 │  │  Matching    │  │ DLC Builder  │  │   PSBT Builder     │ │
 │  │  Service     │  │              │  │                    │ │
 │  │  ──────────  │  │  ──────────  │  │  ──────────────    │ │
@@ -137,9 +155,9 @@ The protocol uses **Discreet Log Contracts (DLCs)** built on **Taproot (P2TR)** 
 │  │  orders by   │  │  secrets &   │  │  PSBTs with pre-   │ │
 │  │  rate and    │  │  Taproot     │  │  embedded adaptor  │ │
 │  │  amount      │  │  scripts     │  │  signatures        │ │
-│  └─────────────┘  └──────────────┘  └────────────────────┘  │
+│  └─────────────┘  └──────────────┘  └────────────────────┘ │
 │                                                             │
-│  ┌─────────────┐   ┌──────────────┐  ┌────────────────────┐ │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐ │
 │  │  Swap        │  │ Script       │  │   Taproot          │ │
 │  │  Monitor     │  │ Builder      │  │   Helpers          │ │
 │  │  ──────────  │  │  ──────────  │  │  ──────────────    │ │
@@ -148,16 +166,33 @@ The protocol uses **Discreet Log Contracts (DLCs)** built on **Taproot (P2TR)** 
 │  │  confirms    │  │  Tapscripts  │  │  tweaked keys,     │ │
 │  │  for both    │  │  (BIP-342)   │  │  control blocks    │ │
 │  │  chains      │  │              │  │  (BIP-341)         │ │
-│  └─────────────┘  └──────────────┘  └────────────────────┘  │
+│  └─────────────┘  └──────────────┘  └────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
          │                                        │
          ▼                                        ▼
 ┌──────────────────┐                    ┌──────────────────┐
-│  Bitcoin Network │                    │ Fractal Bitcoin  │
-│  (BTC)           │                    │ (FB)             │
-│  + conf required │                    │  + conf required │
+│  Bitcoin Network  │                    │ Fractal Bitcoin   │
+│  (BTC)            │                    │ (FB)              │
+│  3 conf required  │                    │ 10 conf required  │
 └──────────────────┘                    └──────────────────┘
 ```
+
+### Batch Matching (1↔1, 1↔N, N↔1, N↔M)
+
+NexumBit supports batch matching to increase throughput and liquidity efficiency:
+
+- **1↔1**: One initiator matches one counter (standard flow).
+- **1↔N**: One initiator matches multiple counters; initiator's amount is split across N counterparties.
+- **N↔1**: Multiple initiators match one counter; counter's amount is split across N initiators.
+- **N↔M**: Multiple initiators match multiple counters in a bipartite allocation.
+
+**Shared adaptor secret**: All pairs in a batch share one adaptor secret. When any party claims, the adaptor is revealed on-chain; other batch members can then claim. Atomicity is preserved across the entire batch.
+
+**Funding policy**: Each swap in a batch has its own DLC A and DLC B. All pairs must be funded before any can transition to READY_TO_CLAIM. Unmatch is only allowed when **no** DLC A in the batch has been funded.
+
+**Refund policy**: Per-swap, per-DLC A. Each user refunds their own DLC A after timelock expiry; no batch coordination. Refund path is independent (OP_CHECKLOCKTIMEVERIFY + sender sig).
+
+**Rate/slippage**: Batch matching uses configurable `BATCH_SLIPPAGE_BPS` (default 1%). Static-rate orders must agree within `MATCH_RATE_STATIC_TOLERANCE_BPS` (5%). Dynamic orders accept market rate.
 
 ---
 
@@ -271,7 +306,7 @@ Each DLC output is a **Taproot (P2TR)** address containing two spending paths in
 
 ```mermaid
 flowchart TD
-    subgraph P2TR["DLC Output — P2TR"]
+    subgraph P2TR["DLC Output — Taproot P2TR Address"]
         IK["Internal Key<br/>(deterministic, no known private key)"]
     end
 
@@ -334,6 +369,8 @@ The refund script allows the original sender to reclaim funds after a block heig
 ```
 
 Transaction must set `nLockTime >= timeout_block_height`.
+
+**Refund grace period (security)**: The timeout used in the refund script is **nominal timeout + REFUND_GRACE_HOURS** (e.g. 24h in blocks). So the sender can only refund after that later block. Until then, only the **receiver** can spend (claim path, no time limit). This prevents "claim then refund" theft: if User A claims DLC B (getting User B's funds) and the adaptor is revealed on-chain, User B has the grace window to still claim DLC A. If the refund path used the nominal timeout only, User A could refund DLC A immediately after claiming and keep both sides.
 
 ### DLC Address Derivation
 
@@ -589,7 +626,54 @@ Refund script:   H_b CLTV DROP <userB_xonly> CHECKSIG
 
 ---
 
-The Claim PSBTs contains the adaptor signature pre-embedded in `taproot_sigs`. The user only needs to add their own Schnorr signature.
+## API Reference
+
+### Core Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/swap/create` | Create a new swap order |
+| `POST` | `/v1/swap/{id}/confirm-dlc-a` | Confirm DLC A funding with txid |
+| `POST` | `/v1/swap/{id}/claim-dlc-b` | Get pre-signed claim PSBT |
+| `POST` | `/v1/swap/{id}/refund-dlc-a` | Get refund PSBT (after timeout) |
+| `POST` | `/v1/swap/{id}/cancel` | Cancel unfunded order |
+| `POST` | `/v1/swap/{id}/unmatch` | Unmatch from counterparty |
+| `GET`  | `/v1/swap/{id}` | Get swap details |
+| `GET`  | `/v1/swap/user/{address}` | Get all swaps for an address |
+| `GET`  | `/v1/swap/active-orders` | List available orders |
+| `GET`  | `/v1/swap/{id}/recovery-kit` | Download recovery data |
+
+### Supporting Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/v1/rate/fb-btc` | Current exchange rate |
+| `GET` | `/v1/stats/bridge` | Bridge statistics |
+| `POST` | `/v1/quote` | Get a swap quote |
+
+### Create Swap Request
+
+```json
+{
+  "quote_id": "abc123...",
+  "user_refund_xonly": "619b7600...",
+  "user_pubkey_to": "02619b76...",
+  "adaptor_secret": "23839a2a...",
+  "matching_enabled": true,
+  "matching_slippage_bps": 500
+}
+```
+
+### Claim Response
+
+```json
+{
+  "psbt_hex": "70736274ff...",
+  "message": "Sign this PSBT with your wallet to claim funds"
+}
+```
+
+The PSBT contains the adaptor signature pre-embedded in `taproot_sigs`. The user only needs to add their own Schnorr signature.
 
 ---
 
@@ -623,35 +707,12 @@ The Claim PSBTs contains the adaptor signature pre-embedded in `taproot_sigs`. T
 
 ## License
 
-This protocol specification and the open-source DLC builder are released under the **MIT License**:
+This protocol specification and the NexumBit implementation are released as **open source**. The cryptographic constructions, script templates, and swap flow described herein are available for anyone to implement, audit, or build upon.
 
-```
-Copyright (c) 2025–2026 NexumBit contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-The protocol is based on well-established Bitcoin primitives (Taproot, Schnorr signatures, CLTV timelocks) and does not rely on any proprietary or patented technology. Chain logos in this document are used for identification; see each project’s terms for logo usage (Bitcoin, Litecoin, Fractal Bitcoin, Bellscoin/Nintondo).
+The protocol is based on well-established Bitcoin primitives (Taproot, Schnorr signatures, CLTV timelocks) and does not rely on any proprietary or patented technology.
 
 ---
 
-
 <p align="center">
-  <sub>Built in Solitude · Powered by Bitcoin Script</sub>
+  <sub>Built with Taproot & Adaptor Signatures · Powered by Bitcoin Script</sub>
 </p>
