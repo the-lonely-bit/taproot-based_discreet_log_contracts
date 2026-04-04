@@ -672,5 +672,5 @@ The protocol is based on well-established Bitcoin primitives (Taproot, Schnorr s
 
 
 <p align="center">
-  <sub>Built in Solitude · Powered by Bitcoin Script</sub>
+  <sub>Built in Solitude ·</sub>
 </p>
