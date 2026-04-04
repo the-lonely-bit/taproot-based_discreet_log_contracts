@@ -118,7 +118,6 @@ From [Overview](#overview) on, this file is the **Bitcoin ↔ Fractal Bitcoin at
 - [Configuration Parameters](#configuration-parameters)
 - [BIP Compliance](#bip-compliance)
 - [License](#license)
-- [What to do next — grants and using the MVP](#what-to-do-next--grants-and-using-the-mvp)
 
 ---
 
