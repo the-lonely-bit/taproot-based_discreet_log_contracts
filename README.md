@@ -78,7 +78,7 @@ The entire flow is coordinated through PSBTs (Partially Signed Bitcoin Transacti
 
 ## See also
 
-From [Lending](#https://github.com/Avecci-Claussen/Taproot-based_Discreet_Log_Contracts/tree/main/lending_dlc_builder) , this current Readme is the **Bitcoin ↔ Fractal Bitcoin atomic swap** specification. **Lending** and **offline signing** live in other docs so we do not duplicate them
+From **[Lending](https://github.com/Avecci-Claussen/Taproot-based_Discreet_Log_Contracts/tree/main/lending_dlc_builder)**, this document is the **Bitcoin ↔ Fractal Bitcoin atomic swap** specification. **Lending** detail and **offline PSBT signing** are covered in companion material we do not duplicate them below:
 
 ---
 
