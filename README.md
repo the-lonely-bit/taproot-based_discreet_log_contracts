@@ -78,13 +78,7 @@ The entire flow is coordinated through PSBTs (Partially Signed Bitcoin Transacti
 
 ## See also
 
-From [Overview](#overview) on, this file is the **Bitcoin ↔ Fractal Bitcoin atomic swap** specification. **Lending** and **offline signing** live in other docs so we do not duplicate them:
-
-- Lending overview — `docs/DLC_LENDING_INTRO.md` in the main NexumBit tree  
-- Developer map — `docs/DLC_LENDING_DEVELOPER_GUIDE.md`  
-- Collateral Tapscript builders — `lending_dlc_builder/` · `lending_dlc_builder/WITNESS.md` (in this package)  
-- PSBT signer — `psbt-signer/` in the main tree  
-- Open-source policy — `WHAT_WE_RELEASE.md` (this folder)  
+From [Lending](#https://github.com/Avecci-Claussen/Taproot-based_Discreet_Log_Contracts/tree/main/lending_dlc_builder) , this current Readme is the **Bitcoin ↔ Fractal Bitcoin atomic swap** specification. **Lending** and **offline signing** live in other docs so we do not duplicate them
 
 ---
 
