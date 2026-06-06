@@ -5,7 +5,7 @@
 <h1 align="center">NexumBit Protocol</h1>
 <p align="center">
   <strong>Taproot-native cross-chain atomic swaps &amp; lending</strong><br>
-  <strong>Protocol v2</strong> — genuine BIP-340 adaptor signatures on P2TR<br>
+  <strong>Protocol v1 -> v2</strong> — genuine BIP-340 adaptor signatures on P2TR<br>
   <strong>Bitcoin ↔ Fractal Bitcoin</strong> (primary swap pair in this specification)
 </p>
 
