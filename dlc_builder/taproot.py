@@ -70,14 +70,25 @@ def taproot_output_script(output_pubkey: bytes) -> bytes:
 
 
 def taproot_tree_helper(scripts: List[bytes]) -> Tuple[bytes, List[bytes]]:
-    """Build 2-leaf tree; returns (merkle_root, leaf_hashes)."""
+    """
+    Build Taproot script tree; returns (merkle_root, leaf_hashes).
+    Supports any N >= 1 leaves (pairwise reduction, odd node carried).
+    """
     if not scripts:
         raise ValueError("At least one script required")
     leaf_hashes = [taproot_leaf_hash(s) for s in scripts]
     if len(leaf_hashes) == 1:
         return leaf_hashes[0], leaf_hashes
-    root = taproot_branch_hash(leaf_hashes[0], leaf_hashes[1])
-    return root, leaf_hashes
+    current_level = leaf_hashes[:]
+    while len(current_level) > 1:
+        next_level: List[bytes] = []
+        for i in range(0, len(current_level), 2):
+            if i + 1 < len(current_level):
+                next_level.append(taproot_branch_hash(current_level[i], current_level[i + 1]))
+            else:
+                next_level.append(current_level[i])
+        current_level = next_level
+    return current_level[0], leaf_hashes
 
 
 def create_control_block(
@@ -102,15 +113,40 @@ def create_control_block(
 
 
 def compute_merkle_proof(target_leaf_hash: bytes, all_leaf_hashes: List[bytes]) -> List[bytes]:
-    """Merkle proof for target leaf in a 2-leaf tree."""
+    """
+    Merkle proof for target leaf. Supports N-leaf trees (same layout as taproot_tree_helper).
+    """
     if target_leaf_hash not in all_leaf_hashes:
         raise ValueError("Target leaf not in tree")
     if len(all_leaf_hashes) == 1:
         return []
     if len(all_leaf_hashes) == 2:
-        other = all_leaf_hashes[1] if all_leaf_hashes[0] == target_leaf_hash else all_leaf_hashes[0]
-        return [other]
-    raise NotImplementedError("Only 2-leaf trees supported")
+        return [all_leaf_hashes[1] if all_leaf_hashes[0] == target_leaf_hash else all_leaf_hashes[0]]
+    idx = all_leaf_hashes.index(target_leaf_hash)
+    level = list(all_leaf_hashes)
+    proof: List[bytes] = []
+    while len(level) > 1:
+        next_level: List[bytes] = []
+        i = 0
+        while i < len(level):
+            if i + 1 < len(level):
+                left, right = level[i], level[i + 1]
+                if idx == i:
+                    proof.append(right)
+                elif idx == i + 1:
+                    proof.append(left)
+                branch = taproot_branch_hash(left, right)
+                next_level.append(branch)
+                if idx == i or idx == i + 1:
+                    idx = len(next_level) - 1
+                i += 2
+            else:
+                next_level.append(level[i])
+                if idx == i:
+                    idx = len(next_level) - 1
+                i += 1
+        level = next_level
+    return proof
 
 
 # Bech32m encoding (BIP-350)
@@ -159,13 +195,15 @@ def _convertbits(data: bytes, frombits: int, tobits: int, pad: bool = True) -> L
     return ret
 
 
-# Known networks: mainnet (BTC/FB), testnet, litecoin, litecoin_testnet.
-# Pass hrp= to support any other chain (e.g. "bel" for Bellscoin).
+# Known networks: mainnet (BTC/FB), testnet, litecoin, litecoin_testnet, digibyte, bellcoin.
+# Pass hrp= to support any other chain.
 DEFAULT_HRP_MAP = {
     "mainnet": "bc",
     "testnet": "tb",
     "litecoin": "ltc",
     "litecoin_testnet": "tltc",
+    "digibyte": "dgb",
+    "bellcoin": "bel",
 }
 
 
@@ -176,8 +214,8 @@ def taproot_address_from_pubkey(
 ) -> str:
     """
     Bech32m Taproot address from 32-byte output pubkey.
-    network: one of mainnet, testnet, litecoin, litecoin_testnet.
-    hrp: if set, overrides network and uses this HRP (e.g. "bel" for Bellscoin).
+    network: one of mainnet, testnet, litecoin, litecoin_testnet, digibyte, bellcoin.
+    hrp: if set, overrides network and uses this HRP (e.g. "dgb" for DigiByte).
     """
     if len(output_pubkey) != 32:
         raise ValueError("Output pubkey must be 32 bytes")

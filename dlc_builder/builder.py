@@ -105,8 +105,8 @@ class DLCBuilder:
         adaptor_point_hex: 66 hex (33 bytes compressed).
         receiver/sender_pubkey_hex: 64 hex (x-only) or 66 hex (compressed).
         timeout: absolute block height for refund path.
-        network: mainnet, testnet, litecoin, litecoin_testnet (ignored if hrp is set).
-        hrp: optional custom bech32 HRP (e.g. "bel" for Bellscoin).
+        network: mainnet, testnet, litecoin, litecoin_testnet, digibyte, bellcoin (ignored if hrp is set).
+        hrp: optional custom bech32 HRP (e.g. "dgb" for DigiByte).
         """
         if len(adaptor_point_hex) != 66 or not adaptor_point_hex.startswith(("02", "03")):
             raise ValueError("Adaptor point must be 66 hex chars (compressed)")

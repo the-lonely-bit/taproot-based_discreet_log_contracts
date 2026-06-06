@@ -1,10 +1,13 @@
-# Taproot DLC Builder
+# Taproot DLC Builder (v1 — deprecated)
+
+> **New swaps use Protocol v2:** [`dlc_v2_builder`](../dlc_v2_builder/README.md) — real BIP-340 adaptor signatures, single-key claim leaf, unspendable NUMS internal key. This package remains for **legacy v1** reference and shared Taproot helpers (`taproot.py`) used by `lending_dlc_builder`.
 
 A **standalone**, **generic** library to build **Discreet Log Contracts (DLCs)** on Taproot for atomic swaps. No backend or API — just the crypto and script construction.
 
-- **Claim path:** adaptor signature + receiver signature (no preimage on-chain).
+- **Claim path (v1):** coordinator co-sign + receiver signature (`<adaptor> CHECKSIGVERIFY <receiver> CHECKSIG`).
 - **Refund path:** `OP_CHECKLOCKTIMEVERIFY` + sender signature after timeout.
 - **Chain-agnostic:** works with any Taproot-capable chain by setting `network` or custom `hrp`.
+- **Merkle trees:** `taproot_tree_helper` / `compute_merkle_proof` support **N leaves** (not only two) — used by the sibling [`lending_dlc_builder`](../lending_dlc_builder/README.md) package for 3-leaf collateral DLCs.
 
 ## BIP compliance
 
