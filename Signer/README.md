@@ -1,10 +1,11 @@
 # NexumBit Recovery & Signing Tool
 
-Standalone, self-sovereign tool for signing transactions/recovering funds from NexumBit **DLC bridge swaps** and **cross-chain lending**. **without** relying on the NexumBit backend — and for signing PSBTs.
+Standalone, self-sovereign tool for recovering funds from NexumBit DLC bridge swaps **without** relying on the NexumBit backend — and for signing **cross-chain lending** Taproot PSBTs (collateral repay, lender claim, safety paths) when you paste a PSBT hex.
 
+This README matches **`signer.py` v2.x** (see the module docstring and `VERSION` in code for the exact build).
 
 ## When You Need This
-- You prefer the External signing option.
+
 - The NexumBit platform is down or unreachable
 - You have a funded DLC swap and need to claim or refund independently
 - You want to verify and sign PSBTs offline before broadcasting
@@ -13,13 +14,14 @@ Standalone, self-sovereign tool for signing transactions/recovering funds from N
 ## Requirements
 
 ```
-pip install embit base58 httpx
+pip install embit base58 httpx bitcash
 ```
 
 | Package | Required | Purpose |
 |---------|----------|---------|
 | `embit` | Yes | Schnorr signatures, key derivation, address parsing |
 | `base58` | Yes | WIF private key decoding |
+| `bitcash` | Yes for **BCH** / **XEC** | CashAddr encode/decode for Taproot P2TR addresses |
 | `httpx` | No | Broadcasting transactions (can broadcast manually without it) |
 
 ## Usage
@@ -41,12 +43,15 @@ Interactive menu:
 | **[7]** | Derive **GRS** Taproot address from private key |
 | **[8]** | Derive **LTC** Taproot address from private key |
 | **[9]** | Derive **BEL** Taproot address from private key |
+| **[10]** | Derive **BCH** Taproot CashAddr (`bitcoincash:…`) from private key |
+| **[11]** | Derive **XEC** Taproot CashAddr (`ecash:…`) from private key |
+| **[12]** | Derive **RVN** Taproot address (`rvn1p…`) from private key |
 
 ### Mode [1] — Sign existing PSBT
 
 Use this when you already have a PSBT hex (e.g., from the NexumBit frontend, API, or another tool). The script **analyzes** each Tapscript leaf and prints a short description per input.
 
-1. Select network: `btc`, `fb`, `ltc`, `bel` (Bellscoin / Nintondo electrs), `dgb`, `grs` (Groestlcoin Blockbook)
+1. Select network: `btc`, `fb`, `ltc`, `bel` (Bellscoin / Nintondo electrs), `dgb`, `grs` (Groestlcoin Blockbook), `bch` / `xec` (Blockchair push), `rvn` (Ravencoin Blockbook)
 2. Paste the PSBT hex
 3. Review the printed line(s) per input (claim, refund, lender hashlock, etc.)
 4. Enter your private key (WIF or 64-char raw hex)
@@ -123,15 +128,40 @@ Your DLC A contains funds you locked. The refund script requires only your signa
 
 The tool builds a transaction with `nLockTime = timeout`, signs it with your key, and the network will accept it once the block height is reached.
 
-### Claim (DLC B)
+### Claim (DLC B) — Protocol v2
 
-Your DLC B contains funds from your counterparty. The claim script requires two signatures — the adaptor secret and your receiver key:
+Your DLC B contains funds from your counterparty. The **on-chain** claim script is a single ephemeral receiver key:
+
+```
+<receiver_xonly> OP_CHECKSIG
+```
+
+Atomicity is **off-chain** via BIP-340 adaptor signatures:
+
+1. You (or the counterparty) hold a **per-swap ephemeral claim key** (`receiver_ephemeral_privkey` in the Recovery Kit — **not** your wallet key).
+2. A **claim pre-signature** `(R', s')` was exchanged while the swap was active (public; useless without `t`).
+3. To claim, **complete** the pre-signature with the adaptor secret `t` → standard 64-byte Schnorr signature.
+4. After the first claim broadcasts, the counterparty **extracts** `t` from the on-chain signature and completes their leg.
+
+**Three key types (do not confuse them):**
+
+| Key | Role |
+|-----|------|
+| Wallet private key | Funds the DLC and signs **refund** after timeout |
+| `receiver_ephemeral_privkey` | Signs the **claim** path (save from Recovery Kit) |
+| Adaptor secret `t` | Swap math secret; revealed on-chain when secret-holder claims |
+
+v2 recovery kit mode **[C]** calls `build_v2_claim_psbt` and prompts for the ephemeral claim key if it is missing from the JSON.
+
+### Claim (v1 legacy kits only)
+
+Older v1 swaps used a 2-of-2 script:
 
 ```
 <adaptor_point> OP_CHECKSIGVERIFY <your_pubkey> OP_CHECKSIG
 ```
 
-The tool uses the adaptor secret from your recovery kit to compute the adaptor signature, embeds it in the PSBT, and you sign with your receiver key.
+The tool still supports v1 kits; new NexumBit swaps are v2.
 
 ### Lending collateral PSBTs (mode [1] only)
 
@@ -142,8 +172,9 @@ For **cross-chain lending**, collateral spends use Tapscript leaves described in
 
 ## Security Notes
 
-- The adaptor secret is only included in the recovery kit when **both** DLCs are funded and confirmed. This prevents claiming before the counterparty has locked their funds.
-- Having the adaptor secret does **not** let you steal the counterparty's funds. Each DLC's claim script requires a different private key.
+- **v2:** The adaptor secret `t` is held by the **secret-holder** until they claim; it may appear in the recovery kit after both legs are funded. Completing a claim reveals `t` on-chain by design.
+- The adaptor secret alone cannot steal funds — each leg's claim requires the matching **ephemeral claim key**.
+- **Save `receiver_ephemeral_privkey` from the Recovery Kit.** If you lose it, you cannot claim (refund still works with your wallet key after timeout).
 - The refund path does **not** require the adaptor secret — only your own key and the timeout.
 - Timelock ordering (DLC A timeout > DLC B timeout) ensures both parties have time to claim before refunds become available.
 
@@ -169,6 +200,15 @@ curl -X POST https://litecoinspace.org/api/tx -d '<raw_tx_hex>'
 
 # Bellscoin (Nintondo electrs)
 curl -X POST https://nintondo.io/api/electrs/tx -d '<raw_tx_hex>'
+
+# Bitcoin Cash (BCExplorer.cash — mempool-style, raw hex body like mempool.space)
+curl -X POST https://bchexplorer.cash/api/tx -d '<raw_tx_hex>' -H 'Content-Type: text/plain'
+
+# eCash (Blockchair — form field `data`, not raw body)
+curl -X POST https://api.blockchair.com/ecash/push/transaction -d "data=<raw_tx_hex>"
+
+# Ravencoin (Blockbook)
+curl -X POST https://blockbook.ravencoin.org/api/v2/sendtx/ -d '<raw_tx_hex>'
 ```
 
 ### DigiByte Taproot (claim/refund) broadcast
@@ -178,7 +218,7 @@ The default DGB endpoint (Atomic Wallet) may reject Taproot transactions with "W
 1. **Manual**: Paste the raw hex at https://digibyteblockexplorer.com/sendtx
 2. **Env override**: Set `DGB_BROADCAST_URL` to your endpoint (e.g. GetBlock with API key, or your DigiByte Core 8.23+ node's Blockbook `/api/tx`)
 
-Optional overrides: `GRS_BROADCAST_URL`, `BEL_BROADCAST_URL`, `LTC_BROADCAST_URL` (same semantics as `DGB_BROADCAST_URL`).
+Optional overrides: `GRS_BROADCAST_URL`, `BEL_BROADCAST_URL`, `LTC_BROADCAST_URL`, `BCH_BROADCAST_URL`, `XEC_BROADCAST_URL`, `RVN_BROADCAST_URL` (same idea: replace or prepend the default endpoint).
 
 ## CLI shortcuts (no menu)
 
@@ -190,9 +230,12 @@ Optional overrides: `GRS_BROADCAST_URL`, `BEL_BROADCAST_URL`, `LTC_BROADCAST_URL
 | `python3 signer.py derive-grs` | Show `grs1p…` + pubkeys |
 | `python3 signer.py derive-ltc` | Show `ltc1p…` + pubkeys |
 | `python3 signer.py derive-bel` | Show `bel1p…` + pubkeys |
+| `python3 signer.py derive-bch` | Show `bitcoincash:…` Taproot CashAddr + pubkeys |
+| `python3 signer.py derive-xec` | Show `ecash:…` Taproot CashAddr + pubkeys |
+| `python3 signer.py derive-rvn` | Show `rvn1p…` + pubkeys |
 | `python3 signer.py sign-bip322 "<message>"` | BIP-322 signature (base64) for quote signing |
 
-Interactive menu **[3]** matches `sign-bip322`; **[4]–[9]** match the six `derive-*` chains in the table (BTC, FB, DGB, GRS, LTC, BEL).
+Interactive menu **[3]** matches `sign-bip322`; **[4]–[12]** match the `derive-*` chains in the table above.
 
 ## License
 

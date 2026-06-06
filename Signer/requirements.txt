@@ -1,3 +1,4 @@
 embit>=0.7.0
 base58>=2.1.0
 httpx>=0.24.0
+bitcash>=1.0.0

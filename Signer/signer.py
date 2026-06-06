@@ -10,14 +10,17 @@ Two modes:
   [2] Build + Sign from Recovery Kit (JSON file or paste)
 
 Supports:
+  - Taproot key-path spend (P2TR funding PSBTs: witness_utxo only, no tap scripts — e.g. LTC aggregate DLC funding)
+  - Bitcoin Cash / eCash: same key-path shape, but signing uses replay-protected sighash when network is bch/xec (not BTC BIP-341 TapSighash)
   - Taproot script-path claim (pre-signed or manual adaptor signature; same shape as oracle co-sign + lender)
   - FAL hashlock lender claim (OP_SHA256 preimage + lender Schnorr — mode [1] prompts for 32-byte preimage)
   - Taproot script-path refund (CLTV + single key), including fixed-term lender leaf and safety refund
   - Private key input: WIF or raw 64-char hex
-  - Broadcasting to Bitcoin / Fractal Bitcoin / Litecoin / Bellscoin / DigiByte / Groestlcoin networks
+  - Broadcasting to Bitcoin / Fractal Bitcoin / Litecoin / Bellscoin / DigiByte / Groestlcoin / Bitcoin Cash / eCash / Ravencoin networks
 
-Dependencies: pip install embit base58 httpx
-  - segwit_addr.py (bundled): DGB/GRS/LTC/BEL address support (dgb1, grs1, ltc1, bel1)
+Dependencies: pip install embit base58 httpx bitcash
+  - segwit_addr.py (bundled): DGB/GRS/LTC/BEL/RVN bech32 (dgb1, grs1, ltc1, bel1, rvn1)
+  - bitcash CashAddr: BCH (bitcoincash:) and XEC (ecash:) Taproot addresses
   - embit:  Required (Schnorr signatures, key derivation)
   - base58: Required (WIF decoding)
   - httpx:  Optional (broadcasting — can broadcast manually without it)
@@ -27,6 +30,7 @@ Usage:  python signer.py
 
 import sys
 import os
+import re
 import json
 import hashlib
 import struct
@@ -37,9 +41,15 @@ from typing import Optional, Tuple, Dict, List, Any
 try:
     from embit.ec import PrivateKey, PublicKey
     from embit import script as embit_script
+    from embit.transaction import Transaction as EmbitTx
+    from embit.transaction import TransactionInput as EmbitTxIn
+    from embit.transaction import TransactionOutput as EmbitTxOut
+    from embit.transaction import SIGHASH as EmbitSIGHASH
+    from embit.script import Script as EmbitScript
     HAS_EMBIT = True
 except ImportError:
     HAS_EMBIT = False
+    EmbitTx = None  # type: ignore
 
 try:
     import base58
@@ -53,7 +63,7 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
-# Local segwit_addr for DGB/GRS/LTC/BEL (dgb1, grs1, ltc1, bel1) — always available
+# Local segwit_addr for DGB/GRS/LTC/BEL/RVN (dgb1, grs1, ltc1, bel1, rvn1) — always available
 try:
     from segwit_addr import decode as segwit_decode
     HAS_SEGWIT_ADDR = True
@@ -67,6 +77,137 @@ except ImportError:
         HAS_SEGWIT_ADDR = True
     except ImportError:
         HAS_SEGWIT_ADDR = False
+
+# Bitcoin Cash CashAddr (P2TR) — same primitives as backend `bch_address.py`
+HAS_BCH_CASHADDR = False
+BCH_MAINNET_PREFIX = "bitcoincash"
+
+try:
+    from bitcash.cashaddress import (
+        calculate_checksum,
+        convertbits,
+        b32encode,
+        b32decode,
+        verify_checksum,
+    )
+
+    def _bch_encode_cashaddr(prefix: str, version_byte: int, payload: bytes) -> str:
+        data = [version_byte] + list(payload)
+        payload_5 = convertbits(data, 8, 5)
+        checksum = calculate_checksum(prefix, payload_5)
+        return prefix + ":" + b32encode(payload_5 + checksum)
+
+    def bch_taproot_output_pubkey_to_cashaddr(
+        output_pubkey_xonly: bytes, prefix: str = BCH_MAINNET_PREFIX
+    ) -> str:
+        if len(output_pubkey_xonly) != 32:
+            raise ValueError("Taproot output pubkey must be 32 bytes")
+        # Match BCH wallets: P2TR uses CashAddr version 11 (same 32-byte x-only as v3, different string).
+        return _bch_encode_cashaddr(prefix, 11, output_pubkey_xonly)
+
+    def bch_cashaddr_to_scriptpubkey(address: str) -> bytes:
+        addr = "".join((address or "").split())
+        if not addr:
+            raise ValueError("empty address")
+        lower = addr.lower()
+        if ":" not in lower:
+            addr = f"{BCH_MAINNET_PREFIX}:{addr}"
+        else:
+            addr = lower
+        prefix, base32string = addr.split(":", 1)
+        decoded = b32decode(base32string)
+        if not verify_checksum(prefix, decoded):
+            raise ValueError("invalid CashAddr checksum")
+        converted = convertbits(decoded, 5, 8)
+        if not converted or len(converted) < 2:
+            raise ValueError("invalid CashAddr payload")
+        version_byte = converted[0]
+        payload = bytes(converted[1:-6])
+        if version_byte in (3, 11) and len(payload) == 32:
+            return bytes([0x51, 0x20]) + payload
+        if len(payload) == 20:
+            if version_byte == 0:
+                return bytes([0x76, 0xA9, 0x14]) + payload + bytes([0x88, 0xAC])
+            if version_byte == 8:
+                return bytes([0xA9, 0x14]) + payload + bytes([0x87])
+        raise ValueError(
+            f"unsupported CashAddr version/length: v={version_byte} len={len(payload)}"
+        )
+
+    HAS_BCH_CASHADDR = True
+except ImportError:
+    def bch_taproot_output_pubkey_to_cashaddr(output_pubkey_xonly: bytes, prefix: str = BCH_MAINNET_PREFIX) -> str:
+        raise RuntimeError("bitcash required for BCH: pip install bitcash")
+
+    def bch_cashaddr_to_scriptpubkey(address: str) -> bytes:
+        raise RuntimeError("bitcash required for BCH: pip install bitcash")
+
+
+def _looks_like_bch_cashaddr(addr: str) -> bool:
+    s = "".join((addr or "").split()).lower()
+    if s.startswith("bitcoincash:") or s.startswith("bchtest:"):
+        return True
+    if ":" not in s and 25 <= len(s) <= 200 and all(
+        c in "qpzry9x8gf2tvdw0s3jn54khce6mua7l" for c in s
+    ):
+        return True
+    return False
+
+
+def _looks_like_ecash_cashaddr(addr: str) -> bool:
+    s = "".join((addr or "").split()).lower()
+    return s.startswith("ecash:")
+
+
+def _hex_bytes(s: Any, field: str = "hex") -> bytes:
+    """Parse hex from recovery-kit strings; strips spaces/newlines inside pasted hex."""
+    if s is None:
+        raise ValueError(f"{field}: missing")
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", str(s).strip())
+    if not cleaned:
+        raise ValueError(f"{field}: empty")
+    if len(cleaned) % 2:
+        raise ValueError(f"{field}: odd hex length ({len(cleaned)} chars after cleaning)")
+    return bytes.fromhex(cleaned)
+
+
+_KIT_KEY_ALIASES = {
+    "redeem_scriptpt_hex": "redeem_script_hex",
+    "success_controlblock": "success_control_block",
+}
+
+
+def _normalize_kit_key(name: Any) -> Any:
+    if not isinstance(name, str):
+        return name
+    compact = re.sub(r"\s+", "", name)
+    return _KIT_KEY_ALIASES.get(compact, compact)
+
+
+def _normalize_recovery_kit(obj: Any) -> Any:
+    """Fix whitespace-broken JSON keys from ugly pastes (matches backend/signer.py)."""
+    if isinstance(obj, dict):
+        return {_normalize_kit_key(k): _normalize_recovery_kit(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_recovery_kit(x) for x in obj]
+    return obj
+
+
+def normalize_signer_network(net: str) -> str:
+    """Map recovery-kit / API chain strings to NETWORKS keys."""
+    n = (net or "btc").strip().lower()
+    aliases = {
+        "bitcoin_cash_mainnet": "bch",
+        "bitcoin_cash": "bch",
+        "bitcoin cash": "bch",
+        "ecash_mainnet": "xec",
+        "ecash": "xec",
+        "ravencoin_mainnet": "rvn",
+        "ravencoin": "rvn",
+        "dogecoin_mainnet": "doge",
+        "dogecoin": "doge",
+    }
+    return aliases.get(n, n)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -117,11 +258,58 @@ NETWORKS = {
         "height_url": "https://blockbook.groestlcoin.org/api/v2",
         "height_json": True,
     },
+    "bch": {
+        "name": "Bitcoin Cash",
+        # Blockchair first (reliable). BCExplorer POST /api/tx often proxies a node that returns RPC -4 for edge-case txs.
+        "broadcast_url": "https://api.blockchair.com/bitcoin-cash/push/transaction",
+        "broadcast_urls": [
+            "https://api.blockchair.com/bitcoin-cash/push/transaction",
+            "https://bchexplorer.cash/api/tx",
+        ],
+        "tx_url": "https://blockchair.com/bitcoin-cash/transaction/",
+        "height_url": "https://api.blockchair.com/bitcoin-cash/stats",
+        "height_blockchair": True,
+    },
+    "xec": {
+        "name": "eCash",
+        "broadcast_url": "https://api.blockchair.com/ecash/push/transaction",
+        "broadcast_urls": ["https://api.blockchair.com/ecash/push/transaction"],
+        "tx_url": "https://blockchair.com/ecash/transaction/",
+        "height_url": "https://api.blockchair.com/ecash/stats",
+        "height_blockchair": True,
+    },
+    "rvn": {
+        "name": "Ravencoin",
+        "broadcast_url": "https://blockbook.ravencoin.org/api/v2/sendtx/",
+        "broadcast_urls": ["https://blockbook.ravencoin.org/api/v2/sendtx/"],
+        "tx_url": "https://blockbook.ravencoin.org/tx/",
+        "height_url": "https://blockbook.ravencoin.org/api/v2",
+        "height_json": True,
+    },
+    "zec": {
+        "name": "Zcash (transparent)",
+        "broadcast_url": "https://api.blockchair.com/zcash/push/transaction",
+        "broadcast_urls": ["https://api.blockchair.com/zcash/push/transaction"],
+        "tx_url": "https://blockchair.com/zcash/transaction/",
+        "height_url": "https://api.blockchair.com/zcash/stats",
+        "height_blockchair": True,
+    },
+    "doge": {
+        "name": "Dogecoin",
+        "broadcast_url": "https://api.blockchair.com/dogecoin/push/transaction",
+        "broadcast_urls": ["https://api.blockchair.com/dogecoin/push/transaction"],
+        "tx_url": "https://blockchair.com/dogecoin/transaction/",
+        "height_url": "https://api.blockchair.com/dogecoin/stats",
+        "height_blockchair": True,
+    },
 }
 
 LOCKTIME_SEQUENCE = 0xFFFFFFFE   # Enable nLockTime
 DEFAULT_FEE_RATE  = 5            # sat/vB — conservative default
 TAPROOT_SCRIPT_VSIZE = 180       # Estimated vsize for 1-in-1-out Taproot script-path spend
+# Rough legacy tx size for 1×P2SH HTLC refund (large redeem + ECDSA sig); sat/byte ≈ sat/vB here.
+P2SH_HTLC_REFUND_VSIZE = 360
+SIGHASH_ALL_FORKID = 0x41        # Bitcoin Cash / eCash replay-protected ECDSA
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -143,6 +331,77 @@ def write_compact(n: int) -> bytes:
     return b'\xff' + struct.pack('<Q', n)
 
 
+def hash256(data: bytes) -> bytes:
+    """Bitcoin double-SHA256 (hash256)."""
+    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+
+
+def bch_replay_signature_hash(
+    tx: "Tx",
+    input_index: int,
+    script_code: bytes,
+    prevout_value: int,
+    n_hash_type: int = 0x00000041,
+) -> bytes:
+    """
+    Bitcoin Cash replay-protected signature digest (BIP143-style with SIGHASH_FORKID).
+
+    Matches bitcoin-cash-node ``SignatureHash`` when the fork-id branch is taken
+    (``SCRIPT_ENABLE_SIGHASH_FORKID``), fork id 0 in the sighash word — i.e.
+    ``n_hash_type`` is typically ``0x00000041`` (``ALL|FORKID``).
+
+    Used for Taproot-shaped funding inputs (witness stack Schnorr + 0x41 suffix):
+    ``script_code`` is the full prevout ``scriptPubKey`` from the PSBT witness_utxo.
+    """
+    if input_index < 0 or input_index >= len(tx.ins):
+        raise ValueError("invalid input index")
+
+    anyone = (n_hash_type & 0x80) != 0
+    base = n_hash_type & 0x1F  # ALL / NONE / SINGLE
+
+    if not anyone:
+        prevouts_blob = b"".join(i.txid + struct.pack("<I", i.vout) for i in tx.ins)
+        hash_prevouts = hash256(prevouts_blob)
+    else:
+        hash_prevouts = b"\x00" * 32
+
+    if (
+        not anyone
+        and base != 0x02  # NONE
+        and base != 0x03  # SINGLE
+    ):
+        seq_blob = b"".join(struct.pack("<I", i.sequence) for i in tx.ins)
+        hash_sequence = hash256(seq_blob)
+    else:
+        hash_sequence = b"\x00" * 32
+
+    if base not in (0x02, 0x03):
+        outs_blob = b"".join(
+            struct.pack("<q", o.value) + write_compact(len(o.spk)) + o.spk for o in tx.outs
+        )
+        hash_outputs = hash256(outs_blob)
+    elif base == 0x03 and input_index < len(tx.outs):
+        o = tx.outs[input_index]
+        outs_blob = struct.pack("<q", o.value) + write_compact(len(o.spk)) + o.spk
+        hash_outputs = hash256(outs_blob)
+    else:
+        hash_outputs = b"\x00" * 32
+
+    inp = tx.ins[input_index]
+    preimage = BytesIO()
+    preimage.write(struct.pack("<i", tx.version))
+    preimage.write(hash_prevouts)
+    preimage.write(hash_sequence)
+    preimage.write(inp.txid + struct.pack("<I", inp.vout))
+    preimage.write(write_compact(len(script_code)) + script_code)
+    preimage.write(struct.pack("<q", prevout_value))
+    preimage.write(struct.pack("<I", inp.sequence))
+    preimage.write(hash_outputs)
+    preimage.write(struct.pack("<I", tx.locktime))
+    preimage.write(struct.pack("<I", n_hash_type))
+    return hash256(preimage.getvalue())
+
+
 def tagged_hash(tag: str, data: bytes) -> bytes:
     t = hashlib.sha256(tag.encode()).digest()
     return hashlib.sha256(t + t + data).digest()
@@ -151,6 +410,155 @@ def tagged_hash(tag: str, data: bytes) -> bytes:
 def tap_leaf_hash(script: bytes, leaf_ver: int = 0xC0) -> bytes:
     buf = struct.pack('B', leaf_ver) + write_compact(len(script)) + script
     return tagged_hash("TapLeaf", buf)
+
+
+# ═══════════════════════════════════════════════════════════════
+# BIP-340 adaptor signatures (Protocol v2) — self-contained secp256k1
+# Mirrors backend/services/adaptor_signature.py byte-for-byte so an offline
+# claim/recovery here is identical to the in-browser / backend signer. Lets the
+# receiver COMPLETE a pre-signature with the adaptor secret t to produce a
+# standard Schnorr signature for the single-key claim leaf.
+# ═══════════════════════════════════════════════════════════════
+
+_ADP_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+_ADP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_ADP_GX = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+_ADP_GY = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+_ADP_G = (_ADP_GX, _ADP_GY)
+
+
+def _adp_inv(a, m=_ADP_P):
+    return pow(a, m - 2, m)
+
+
+def _adp_add(p1, p2):
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2 and (y1 + y2) % _ADP_P == 0:
+        return None
+    if p1 == p2:
+        lam = (3 * x1 * x1) * _adp_inv(2 * y1 % _ADP_P) % _ADP_P
+    else:
+        lam = (y2 - y1) * _adp_inv((x2 - x1) % _ADP_P) % _ADP_P
+    x3 = (lam * lam - x1 - x2) % _ADP_P
+    y3 = (lam * (x1 - x3) - y1) % _ADP_P
+    return (x3, y3)
+
+
+def _adp_mul(p, k):
+    r = None
+    k %= _ADP_N
+    while k:
+        if k & 1:
+            r = _adp_add(r, p)
+        p = _adp_add(p, p)
+        k >>= 1
+    return r
+
+
+def _adp_even(p):
+    return p[1] % 2 == 0
+
+
+def _adp_lift_x(x):
+    if x >= _ADP_P:
+        return None
+    y_sq = (pow(x, 3, _ADP_P) + 7) % _ADP_P
+    y = pow(y_sq, (_ADP_P + 1) // 4, _ADP_P)
+    if pow(y, 2, _ADP_P) != y_sq:
+        return None
+    return (x, y if y % 2 == 0 else _ADP_P - y)
+
+
+def _adp_b32(n):
+    return n.to_bytes(32, "big")
+
+
+def _adp_ser(p):
+    return (b"\x02" if p[1] % 2 == 0 else b"\x03") + _adp_b32(p[0])
+
+
+def _adp_parse(b):
+    if len(b) == 33 and b[0] in (0x02, 0x03):
+        pt = _adp_lift_x(int.from_bytes(b[1:], "big"))
+        if pt is None:
+            raise ValueError("invalid compressed point")
+        return pt if b[0] == 0x02 else (pt[0], _ADP_P - pt[1])
+    if len(b) == 32:
+        pt = _adp_lift_x(int.from_bytes(b, "big"))
+        if pt is None:
+            raise ValueError("invalid x-only point")
+        return pt
+    raise ValueError("expected 33-byte compressed or 32-byte x-only point")
+
+
+def _adp_challenge(r_x, p_x, msg):
+    return int.from_bytes(
+        tagged_hash("BIP0340/challenge", _adp_b32(r_x) + _adp_b32(p_x) + msg), "big"
+    ) % _ADP_N
+
+
+def adaptor_point_from_secret(secret: bytes) -> bytes:
+    t = int.from_bytes(secret, "big") % _ADP_N
+    if t == 0:
+        raise ValueError("adaptor secret is zero")
+    return _adp_ser(_adp_mul(_ADP_G, t))
+
+
+def adaptor_presign(seckey: bytes, msg: bytes, adaptor_point: bytes) -> bytes:
+    if len(msg) != 32:
+        raise ValueError("msg must be 32 bytes")
+    d0 = int.from_bytes(seckey, "big") % _ADP_N
+    if d0 == 0:
+        raise ValueError("secret key is zero")
+    P = _adp_mul(_ADP_G, d0)
+    d = d0 if _adp_even(P) else _ADP_N - d0
+    T = _adp_parse(adaptor_point)
+    for counter in range(256):
+        k = int.from_bytes(
+            tagged_hash("NexumBit/adaptor/nonce",
+                        seckey + msg + _adp_ser(T) + counter.to_bytes(4, "big")), "big"
+        ) % _ADP_N
+        if k == 0:
+            continue
+        Rp = _adp_mul(_ADP_G, k)
+        R_adapted = _adp_add(Rp, T)
+        if R_adapted is None or not _adp_even(R_adapted):
+            continue
+        e = _adp_challenge(R_adapted[0], P[0], msg)
+        s = (k + e * d) % _ADP_N
+        return _adp_ser(Rp) + _adp_b32(s)
+    raise RuntimeError("failed to find nonce")
+
+
+def adaptor_complete(presig: bytes, adaptor_secret: bytes) -> bytes:
+    if len(presig) != 65:
+        raise ValueError("presig must be 65 bytes")
+    Rp = _adp_parse(presig[:33])
+    s_prime = int.from_bytes(presig[33:65], "big")
+    t = int.from_bytes(adaptor_secret, "big") % _ADP_N
+    if t == 0:
+        raise ValueError("adaptor secret is zero")
+    R_adapted = _adp_add(Rp, _adp_mul(_ADP_G, t))
+    if R_adapted is None or not _adp_even(R_adapted):
+        raise ValueError("adapted nonce has odd Y — presignature malformed")
+    s = (s_prime + t) % _ADP_N
+    return _adp_b32(R_adapted[0]) + _adp_b32(s)
+
+
+def adaptor_extract(presig: bytes, full_sig: bytes, adaptor_point: bytes):
+    if len(presig) != 65 or len(full_sig) != 64:
+        return None
+    t = (int.from_bytes(full_sig[32:64], "big") - int.from_bytes(presig[33:65], "big")) % _ADP_N
+    if t == 0:
+        return None
+    if _adp_mul(_ADP_G, t) != _adp_parse(adaptor_point):
+        return None
+    return _adp_b32(t)
 
 
 def tap_branch_hash(a: bytes, b: bytes) -> bytes:
@@ -165,12 +573,26 @@ def tap_tweak(internal_key: bytes, merkle_root: bytes) -> bytes:
 def address_to_scriptpubkey(addr: str) -> bytes:
     """
     Convert address to raw scriptpubkey bytes.
-    Supports: bc1, tb1 (embit), dgb1, grs1, ltc1, bel1 (segwit_addr for Taproot).
+    Supports: bc1, tb1 (embit); ecash: / bitcoincash: CashAddr P2TR (bitcash);
+    dgb1, grs1, ltc1, bel1, rvn1 (segwit_addr for Taproot).
     """
-    addr_lower = addr.strip().lower()
-    # Alt-chain bech32m (dgb1, grs1, ltc1, bel1)
+    addr = "".join((addr or "").split())
+    addr_lower = addr.lower()
+    # eCash CashAddr (ecash:… Taproot) — before BCH so explicit ecash: is unambiguous
+    if HAS_BCH_CASHADDR and _looks_like_ecash_cashaddr(addr_lower):
+        try:
+            return bch_cashaddr_to_scriptpubkey(addr)
+        except Exception as e:
+            raise ValueError(f"Invalid or undecodable eCash CashAddr: {e}") from e
+    # Bitcoin Cash CashAddr (P2TR q/p… or bitcoincash:…)
+    if HAS_BCH_CASHADDR and _looks_like_bch_cashaddr(addr_lower):
+        try:
+            return bch_cashaddr_to_scriptpubkey(addr)
+        except Exception as e:
+            raise ValueError(f"Invalid or undecodable CashAddr: {e}") from e
+    # Alt-chain bech32m (dgb1, grs1, ltc1, bel1, rvn1, doge1)
     if HAS_SEGWIT_ADDR:
-        for hrp in ("dgb", "grs", "ltc", "bel"):
+        for hrp in ("dgb", "grs", "ltc", "bel", "rvn", "doge"):
             if addr_lower.startswith(hrp + "1"):
                 try:
                     ver, prog = segwit_decode(hrp, addr)
@@ -184,9 +606,9 @@ def address_to_scriptpubkey(addr: str) -> bytes:
     try:
         return embit_script.address_to_scriptpubkey(addr).data
     except Exception:
-        if addr_lower.startswith(("dgb1", "grs1", "ltc1", "bel1")):
+        if addr_lower.startswith(("dgb1", "grs1", "ltc1", "bel1", "rvn1", "doge1")):
             raise ValueError(
-                f"DGB/GRS/LTC/BEL address detected but segwit_addr module not found. "
+                f"DGB/GRS/LTC/BEL/RVN/DOGE address detected but segwit_addr module not found. "
                 f"Ensure segwit_addr.py is in the same directory as signer.py."
             ) from None
         raise
@@ -199,12 +621,14 @@ def address_to_scriptpubkey(addr: str) -> bytes:
 def decode_wif(wif: str) -> Tuple[bytes, bool]:
     """
     Decode WIF to (32-byte secret, compressed).
-    Supports: Bitcoin/FB mainnet (0x80), testnet (0xEF), DGB/GRS mainnet (0x80).
+    Accepts any standard version byte after base58check (0x80 BTC/FB/DGB/GRS/BCH/…,
+    0xEF testnet, 0xB0 Litecoin, 0x9E Doge/BEL-style, 0x99 Bellscoin wallets, etc.).
     """
     raw = base58.b58decode_check(wif)
-    if raw[0] in (0x80, 0xEF):
-        if len(raw) == 34 and raw[-1] == 0x01: return raw[1:33], True
-        if len(raw) == 33: return raw[1:33], False
+    if len(raw) == 34 and raw[-1] == 0x01:
+        return raw[1:33], True
+    if len(raw) == 33:
+        return raw[1:33], False
     raise ValueError(f"Invalid WIF (version=0x{raw[0]:02x}, len={len(raw)})")
 
 
@@ -214,11 +638,12 @@ def parse_private_key(key_input: str) -> Tuple[bytes, bytes]:
     Returns (32-byte key, 32-byte x-only pubkey).
     """
     key_input = key_input.strip()
+    hex_clean = re.sub(r"[^0-9a-fA-F]", "", key_input)
 
-    # Try raw hex (64 chars = 32 bytes)
-    if len(key_input) == 64:
+    # Try raw hex (64 hex chars = 32 bytes); allow spaces in pasted hex
+    if len(hex_clean) == 64:
         try:
-            key_bytes = bytes.fromhex(key_input)
+            key_bytes = bytes.fromhex(hex_clean)
             xonly = PrivateKey(key_bytes).get_public_key().xonly()
             return key_bytes, xonly
         except Exception:
@@ -233,7 +658,7 @@ def parse_private_key(key_input: str) -> Tuple[bytes, bytes]:
         except Exception:
             pass
 
-    raise ValueError("Invalid key. Provide WIF (starts with K/L/5) or 64-char raw hex.")
+    raise ValueError("Invalid key. Provide a standard base58-check WIF or 64-char raw hex.")
 
 
 def derive_btc_from_private_key(key_input: str) -> Tuple[str, str, str]:
@@ -399,6 +824,93 @@ def derive_bel_from_private_key(key_input: str) -> Tuple[str, str, str]:
     return address, xonly_hex, compressed_hex
 
 
+def derive_bch_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From BCH private key (WIF or 64-char hex), derive Taproot CashAddr and pubkeys.
+
+    Returns:
+        (address bitcoincash:..., xonly 64 hex, compressed 66 hex)
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for BCH derivation")
+    if not HAS_BCH_CASHADDR:
+        raise RuntimeError("bitcash required for BCH: pip install bitcash")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    address = bch_taproot_output_pubkey_to_cashaddr(output_xonly)
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
+
+
+def derive_xec_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From eCash private key (WIF or 64-char hex), derive Taproot CashAddr (ecash:…) and pubkeys.
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for XEC derivation")
+    if not HAS_BCH_CASHADDR:
+        raise RuntimeError("bitcash required for XEC: pip install bitcash")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    address = bch_taproot_output_pubkey_to_cashaddr(output_xonly, prefix="ecash")
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
+
+
+def derive_rvn_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From Ravencoin private key (WIF or 64-char hex), derive Taproot address (rvn1p…) and pubkeys.
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for RVN derivation")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    try:
+        from embit import bech32
+        address = bech32.encode("rvn", 1, output_xonly)
+    except ImportError:
+        address = None
+    if address is None:
+        raise ValueError("Could not encode RVN address (embit.bech32 required)")
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
+
+
+def derive_doge_from_private_key(key_input: str) -> Tuple[str, str, str]:
+    """
+    From Dogecoin private key (WIF or 64-char hex), derive Taproot address (doge1p…) and pubkeys.
+    """
+    if not HAS_EMBIT:
+        raise RuntimeError("embit required for DOGE derivation")
+    key_bytes, xonly = parse_private_key(key_input)
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    output_key = pub.taproot_tweak(b"")
+    output_xonly = output_key.xonly()
+    try:
+        from embit import bech32
+        address = bech32.encode("doge", 1, output_xonly)
+    except ImportError:
+        address = None
+    if address is None:
+        raise ValueError("Could not encode DOGE address (embit.bech32 required)")
+    xonly_hex = xonly.hex()
+    compressed_hex = pub.sec().hex()
+    return address, xonly_hex, compressed_hex
+
+
 # ═══════════════════════════════════════════════════════════════
 # Minimal transaction types
 # ═══════════════════════════════════════════════════════════════
@@ -463,6 +975,211 @@ class Tx:
 
 
 # ═══════════════════════════════════════════════════════════════
+# P2SH HTLC (hybrid DLC routes — BCH / XEC / RVN / ZEC)
+# ═══════════════════════════════════════════════════════════════
+
+def _push_bytes_htlc(data: bytes) -> bytes:
+    n = len(data)
+    if n < 0x4C:
+        return bytes([n]) + data
+    if n <= 0xFF:
+        return bytes([0x4C, n]) + data
+    if n <= 0xFFFF:
+        return bytes([0x4D]) + n.to_bytes(2, "little") + data
+    return bytes([0x4E]) + n.to_bytes(4, "little") + data
+
+
+def _serialize_scriptcode(redeem_script: bytes) -> bytes:
+    """BIP143 scriptCode: compact length + redeem script (P2SH spends use redeemScript as scriptCode)."""
+    return write_compact(len(redeem_script)) + redeem_script
+
+
+def _bch_replay_protected_sighash(
+    tx: Tx,
+    input_index: int,
+    redeem_script: bytes,
+    value: int,
+    fork_id: int = 0,
+) -> bytes:
+    """Digest for BCH/XEC replay-protected ECDSA (ALL|FORKID)."""
+    n_hash_type = SIGHASH_ALL_FORKID
+
+    def _hp() -> bytes:
+        buf = b"".join(tx.ins[i].txid + struct.pack("<I", tx.ins[i].vout) for i in range(len(tx.ins)))
+        return hash256(buf)
+
+    def _hs() -> bytes:
+        buf = b"".join(struct.pack("<I", tx.ins[i].sequence) for i in range(len(tx.ins)))
+        return hash256(buf)
+
+    def _ho() -> bytes:
+        buf = b"".join(
+            struct.pack("<q", o.value) + write_compact(len(o.spk)) + o.spk for o in tx.outs
+        )
+        return hash256(buf)
+
+    inp = tx.ins[input_index]
+    outpoint = inp.txid + struct.pack("<I", inp.vout)
+    script_code = _serialize_scriptcode(redeem_script)
+    preimage = (
+        struct.pack("<i", tx.version)
+        + _hp()
+        + _hs()
+        + outpoint
+        + script_code
+        + struct.pack("<q", value)
+        + struct.pack("<I", inp.sequence)
+        + _ho()
+        + struct.pack("<I", tx.locktime)
+        + struct.pack("<I", ((fork_id << 8) | n_hash_type))
+    )
+    return hash256(preimage)
+
+
+def _legacy_embit_sighash(tx: Tx, input_index: int, redeem_script: bytes) -> bytes:
+    """Bitcoin-like legacy sighash (Ravencoin / Zcash transparent P2SH)."""
+    vin = []
+    for i in tx.ins:
+        tid_be = bytes(reversed(i.txid))
+        vin.append(EmbitTxIn(tid_be, i.vout, EmbitScript(i.script_sig), i.sequence))
+    vout = [EmbitTxOut(o.value, EmbitScript(o.spk)) for o in tx.outs]
+    etx = EmbitTx(version=tx.version, vin=vin, vout=vout, locktime=tx.locktime)
+    return etx.sighash_legacy(input_index, EmbitScript(redeem_script), EmbitSIGHASH.ALL)
+
+
+def _extract_htlc_sender_pubkey_compressed(redeem: bytes) -> bytes:
+    """Last branch: CLTV DROP <33-byte pk> OP_CHECKSIG OP_ENDIF."""
+    if len(redeem) < 37 or redeem[-2] != 0xAC or redeem[-1] != 0x68:
+        raise ValueError("Unexpected HTLC redeem script tail (expected … OP_CHECKSIG OP_ENDIF)")
+    if redeem[-36] != 0x21:
+        raise ValueError("Expected 0x21 push before sender OP_CHECKSIG")
+    pk = redeem[-35:-2]
+    if len(pk) != 33 or pk[0] not in (0x02, 0x03):
+        raise ValueError("Sender pubkey must be 33-byte compressed secp256k1")
+    return pk
+
+
+def _p2pkh_scriptpubkey_compressed(pub33: bytes) -> bytes:
+    """Classic P2PKH locking script (standard on BCH/XEC mempools)."""
+    from embit.hashes import hash160
+
+    h20 = hash160(pub33)
+    return bytes([0x76, 0xA9, 0x14]) + h20 + bytes([0x88, 0xAC])
+
+
+def _p2sh_htlc_refund_output_scriptpubkey(sender_spk: bytes, redeem: bytes, net: str) -> Tuple[bytes, bool]:
+    """
+    BCH/eCash standard relay only allows a small set of output types (P2PKH, P2SH, …).
+    Taproot-shaped CashAddr decodes to OP_1 <32-byte> (same bytes as BTC P2TR), which is
+    **non-standard** for typical BCH mempool relay — Blockchair / nodes reject it (scriptpubkey).
+    Use P2PKH built from the HTLC sender pubkey (same key as the p… Taproot CashAddr).
+    """
+    if net not in ("bch", "xec"):
+        return sender_spk, False
+    if len(sender_spk) == 34 and sender_spk[0] == 0x51 and sender_spk[1] == 0x20:
+        pk = _extract_htlc_sender_pubkey_compressed(redeem)
+        return _p2pkh_scriptpubkey_compressed(pk), True
+    return sender_spk, False
+
+
+def _p2sh_htlc_refund_network(kit: Dict) -> str:
+    desc = (kit.get("dlc_a") or {}).get("descriptor") or {}
+    t = str(desc.get("type", "")).lower()
+    ch = str(desc.get("chain") or kit.get("from_chain") or "BCH").upper()
+    if t == "bch_htlc":
+        ch = "BCH"
+    m = {"BCH": "bch", "XEC": "xec", "RVN": "rvn", "ZEC": "zec"}
+    net = m.get(ch)
+    if not net:
+        raise ValueError(f"Unsupported P2SH HTLC chain {ch!r} (expected BCH/XEC/RVN/ZEC)")
+    if net not in NETWORKS:
+        raise ValueError(f"Network {net!r} not configured in signer NETWORKS")
+    return net
+
+
+def _is_p2sh_htlc_dlc_a(kit: Dict) -> bool:
+    desc = (kit.get("dlc_a") or {}).get("descriptor") or {}
+    return str(desc.get("type", "")).lower() in ("p2sh_htlc", "bch_htlc")
+
+
+def build_p2sh_htlc_refund_unsigned(kit: Dict, fee_rate: int = DEFAULT_FEE_RATE) -> Tuple[Tx, bytes, int, int, int, str, bool]:
+    """
+    Build unsigned legacy refund tx for P2SH HTLC DLC A.
+    Returns (tx, redeem_script, dlc_value_sats, fee, output_value, network_key, bch_p2pkh_output).
+    ``bch_p2pkh_output`` is True when the refund was directed to P2PKH for BCH/eCash relay (see _p2sh_htlc_refund_output_scriptpubkey).
+    """
+    dlc = kit.get("dlc_a") or {}
+    desc = dlc.get("descriptor") or {}
+    redeem = _hex_bytes(desc.get("redeem_script_hex"), "redeem_script_hex")
+    if not redeem:
+        raise ValueError("redeem_script_hex missing from P2SH HTLC descriptor")
+
+    cltv = int(desc.get("cltv_height") or kit.get("timeout_a") or 0)
+    if cltv <= 0:
+        raise ValueError("cltv_height / timeout_a missing for HTLC refund")
+
+    dlc_value = int(dlc.get("value") or kit.get("from_amount") or 0)
+    if dlc_value <= 0:
+        raise ValueError("DLC A value unknown")
+
+    vout = int(dlc.get("vout") or 0)
+    txid_raw = dlc.get("txid")
+    if not txid_raw:
+        raise ValueError("DLC A txid missing")
+    prev_txid = _hex_bytes(txid_raw, "dlc_a.txid")[::-1]
+
+    sender_addr = kit.get("user_address_from")
+    if not sender_addr:
+        raise ValueError("user_address_from missing")
+    sender_spk = address_to_scriptpubkey(sender_addr)
+
+    fee = max(1, int(fee_rate)) * P2SH_HTLC_REFUND_VSIZE
+    output_value = dlc_value - fee
+    if output_value < 546:
+        raise ValueError(
+            f"DLC value ({dlc_value} sats) too small for fee (~{fee} sats est.) — increase amount or lower fee_rate"
+        )
+
+    net = _p2sh_htlc_refund_network(kit)
+    sender_spk, bch_p2pkh_output = _p2sh_htlc_refund_output_scriptpubkey(sender_spk, redeem, net)
+
+    tx = Tx()
+    tx.version = 2
+    tx.locktime = cltv
+    tx.ins = [TxIn(prev_txid, vout, b"", LOCKTIME_SEQUENCE)]
+    tx.outs = [TxOut(output_value, sender_spk)]
+
+    return tx, redeem, dlc_value, fee, output_value, net, bch_p2pkh_output
+
+
+def sign_p2sh_htlc_refund_tx(tx: Tx, redeem: bytes, dlc_value: int, net: str, key_bytes: bytes) -> str:
+    """ECDSA-sign input 0 and return complete raw tx hex (legacy, no witness)."""
+    use_bch_sighash = net in ("bch", "xec")
+    pk_pub = PrivateKey(key_bytes).get_public_key().sec()
+    sender_expect = _extract_htlc_sender_pubkey_compressed(redeem)
+    if pk_pub != sender_expect:
+        raise ValueError(
+            f"Key does not match HTLC sender pubkey in redeem script.\n"
+            f"    Expected (hex): {sender_expect.hex()}\n"
+            f"    Your key:       {pk_pub.hex()}"
+        )
+
+    if use_bch_sighash:
+        msg = _bch_replay_protected_sighash(tx, 0, redeem, dlc_value)
+        sighash_byte = SIGHASH_ALL_FORKID
+    else:
+        msg = _legacy_embit_sighash(tx, 0, redeem)
+        sighash_byte = 0x01
+
+    sig = PrivateKey(key_bytes).sign(msg)
+    der = sig.serialize() if hasattr(sig, "serialize") else bytes(sig)
+    sig_and_type = der + bytes([sighash_byte])
+    script_sig = _push_bytes_htlc(sig_and_type) + b"\x00" + _push_bytes_htlc(redeem)
+    tx.ins[0].script_sig = script_sig
+    return tx.raw().hex()
+
+
+# ═══════════════════════════════════════════════════════════════
 # PSBT parser
 # ═══════════════════════════════════════════════════════════════
 
@@ -478,8 +1195,8 @@ class PInput:
         self.tap_script_sigs = {}  # {(xonly_32, leaf_hash_32): sig_bytes}
 
 
-def parse_psbt(data: bytes) -> Tuple[Tx, List[PInput]]:
-    """Parse PSBT v0. Returns (unsigned_tx, list_of_inputs)."""
+def _parse_psbt_minimal(data: bytes) -> Tuple[Tx, List[PInput]]:
+    """Parse PSBT v0 with the built-in reader (fast path)."""
     s = BytesIO(data)
     if s.read(5) != b'psbt\xff':
         raise ValueError("Bad PSBT magic")
@@ -487,9 +1204,13 @@ def parse_psbt(data: bytes) -> Tuple[Tx, List[PInput]]:
     # Global map
     while True:
         kl = read_compact(s)
-        if kl == 0: break
-        k = s.read(kl); vl = read_compact(s); v = s.read(vl)
-        if k[0] == 0x00: tx = Tx.parse(v)
+        if kl == 0:
+            break
+        k = s.read(kl)
+        vl = read_compact(s)
+        v = s.read(vl)
+        if k[0] == 0x00:
+            tx = Tx.parse(v)
     if not tx:
         raise ValueError("Missing unsigned tx in PSBT")
     # Per-input maps
@@ -498,8 +1219,11 @@ def parse_psbt(data: bytes) -> Tuple[Tx, List[PInput]]:
         p = PInput()
         while True:
             kl = read_compact(s)
-            if kl == 0: break
-            k = s.read(kl); vl = read_compact(s); v = s.read(vl)
+            if kl == 0:
+                break
+            k = s.read(kl)
+            vl = read_compact(s)
+            v = s.read(vl)
             if k[0] == 0x01:       # WITNESS_UTXO
                 vs = BytesIO(v)
                 p.utxo_value = struct.unpack('<q', vs.read(8))[0]
@@ -522,9 +1246,68 @@ def parse_psbt(data: bytes) -> Tuple[Tx, List[PInput]]:
     for _ in range(len(tx.outs)):
         while True:
             kl = read_compact(s)
-            if kl == 0: break
-            s.read(kl); vl = read_compact(s); s.read(vl)
+            if kl == 0:
+                break
+            s.read(kl)
+            vl = read_compact(s)
+            s.read(vl)
     return tx, inputs
+
+
+def _parse_psbt_via_embit(data: bytes) -> Tuple[Tx, List[PInput]]:
+    """
+    Fallback: embit's PSBT parser (handles more variants / edge cases than _parse_psbt_minimal).
+    """
+    if not HAS_EMBIT:
+        raise ValueError("embit required for PSBT fallback parse")
+    from embit.psbt import PSBT
+
+    psbt = PSBT.parse(data)
+    raw_tx = psbt.tx.serialize()
+    tx = Tx.parse(raw_tx)
+    inputs: List[PInput] = []
+    for inp in psbt.inputs:
+        p = PInput()
+        if inp.witness_utxo is not None:
+            p.utxo_value = inp.witness_utxo.value
+            p.utxo_spk = inp.witness_utxo.script_pubkey.data
+        elif inp.non_witness_utxo is not None and inp.vout is not None:
+            prev_out = inp.non_witness_utxo.vout[inp.vout]
+            p.utxo_value = prev_out.value
+            p.utxo_spk = prev_out.script_pubkey.data
+        if inp.taproot_internal_key is not None:
+            p.tap_internal_key = inp.taproot_internal_key.xonly()
+        if inp.taproot_merkle_root is not None:
+            p.tap_merkle_root = inp.taproot_merkle_root
+        for control_block, leaf_val in (inp.taproot_scripts or {}).items():
+            if not leaf_val:
+                continue
+            leaf_ver = leaf_val[-1] & 0xFE
+            script = leaf_val[:-1] if len(leaf_val) > 1 else leaf_val
+            p.leaves.append((control_block, script, leaf_ver))
+        for (pub, leaf_h), sig in (inp.taproot_sigs or {}).items():
+            p.tap_script_sigs[(pub.xonly(), leaf_h)] = (
+                sig if isinstance(sig, bytes) else sig.serialize()
+                if hasattr(sig, "serialize")
+                else bytes(sig)
+            )
+        inputs.append(p)
+    return tx, inputs
+
+
+def parse_psbt(data: bytes) -> Tuple[Tx, List[PInput]]:
+    """Parse PSBT v0. Returns (unsigned_tx, list_of_inputs). Uses embit if the minimal parser fails."""
+    try:
+        return _parse_psbt_minimal(data)
+    except Exception as e_min:
+        if not HAS_EMBIT:
+            raise
+        try:
+            return _parse_psbt_via_embit(data)
+        except Exception as e_emb:
+            raise ValueError(
+                f"PSBT parse failed (minimal: {e_min!s}; embit: {e_emb!s})"
+            ) from e_emb
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -640,7 +1423,16 @@ def analyze_script(script: bytes) -> Dict[str, Any]:
             'description': 'FAL lender claim: SHA256 preimage + lender key',
         }
 
-    # Success: <32> OP_CHECKSIGVERIFY <32> OP_CHECKSIG
+    # v2 claim: <32> OP_CHECKSIG  (single receiver key — adaptor completed off-chain)
+    if len(script) == 34 and script[0] == 0x20 and script[33] == 0xAC:
+        return {
+            'type': 'v2_claim',
+            'receiver_pubkey': script[1:33],
+            'sigs_needed': 1,
+            'description': 'v2 claim (single-key): completed BIP-340 adaptor signature',
+        }
+
+    # v1 success: <32> OP_CHECKSIGVERIFY <32> OP_CHECKSIG
     #          20 <adaptor|oracle:32> AD 20 <receiver|lender:32> AC
     if (len(script) == 68 and script[0] == 0x20 and script[33] == 0xAD
             and script[34] == 0x20 and script[67] == 0xAC):
@@ -747,6 +1539,34 @@ def bip322_hash(message: str) -> bytes:
     return hashlib.sha256(tag_hash + tag_hash + msg_bytes).digest()
 
 
+def _p2tr_output_xonly_from_witness_utxo_spk(spk: bytes) -> Optional[bytes]:
+    """
+    Extract 32-byte Taproot output key (x-only) from witness_utxo scriptPubKey.
+
+    - Bitcoin-style v1 P2TR: ``51 20`` + 32 bytes (34 bytes total).
+    - Bitcoin Cash native P2TR locking: ``aa 20`` + 32 bytes + ``87`` (35 bytes; on-chain ``aa20…87`` form).
+    """
+    if len(spk) == 34 and spk[0] == 0x51 and spk[1] == 0x20:
+        return spk[2:34]
+    if len(spk) == 35 and spk[0] == 0xAA and spk[1] == 0x20 and spk[34] == 0x87:
+        return spk[2:34]
+    return None
+
+
+def _p2wpkh_hash_from_witness_utxo_spk(spk: bytes) -> Optional[bytes]:
+    """Extract HASH160(pubkey) from native SegWit v0 P2WPKH witness_utxo."""
+    if len(spk) == 22 and spk[0] == 0x00 and spk[1] == 0x14:
+        return spk[2:22]
+    return None
+
+
+def _p2pkh_scriptcode(pubkey_hash: bytes) -> bytes:
+    """BIP-143 scriptCode for P2WPKH: DUP HASH160 <20> EQUALVERIFY CHECKSIG."""
+    if len(pubkey_hash) != 20:
+        raise ValueError("pubkey hash must be 20 bytes")
+    return bytes.fromhex("76a914") + pubkey_hash + bytes.fromhex("88ac")
+
+
 def sign_bip322_message(message: str, key_bytes: bytes, scriptpubkey: bytes) -> str:
     """
     Sign a BIP-322 simple message for Taproot (P2TR) address.
@@ -793,12 +1613,80 @@ def sign_bip322_message(message: str, key_bytes: bytes, scriptpubkey: bytes) -> 
     return base64.b64encode(encoded).decode("ascii")
 
 
+def sign_bip322_zec_transparent(message: str, key_bytes: bytes, address: str) -> str:
+    """
+    BIP-322 simple for Zcash mainnet transparent t1 (P2PKH) or t3 (P2SH wrapping that P2PKH).
+    Returns base64-encoded **full signed to_sign transaction** (required for non-segwit BIP-322).
+    """
+    import base64 as _b64
+
+    from embit import compact
+    from embit.base58 import encode_check
+    from embit.hashes import hash160
+    from embit.script import Script
+    from embit.transaction import Transaction, TransactionInput, TransactionOutput
+
+    ZEC_PUB = bytes([0x1C, 0xB8])
+    ZEC_SCR = bytes([0x1C, 0xBD])
+
+    a = address.strip()
+    pk = PrivateKey(key_bytes)
+    pub = pk.get_public_key()
+    pubc = pub.sec()
+    h20 = hash160(pubc)
+    redeem_p2pkh = bytes([0x76, 0xA9, 0x14]) + h20 + bytes([0x88, 0xAC])
+
+    if a.startswith("t1"):
+        if encode_check(ZEC_PUB + h20) != a:
+            raise ValueError("Private key does not match t1 address")
+        spk = redeem_p2pkh
+        sighash_script = Script(spk)
+
+        def _script_sig(sig):
+            return embit_script.script_sig_p2pkh(sig, pub)
+
+    elif a.startswith("t3"):
+        r20 = hash160(redeem_p2pkh)
+        if encode_check(ZEC_SCR + r20) != a:
+            raise ValueError(
+                "Private key does not match t3 address (expected P2SH of standard P2PKH redeem script)"
+            )
+        spk = bytes([0xA9, 0x14]) + r20 + bytes([0x87])
+        # P2SH spends sign with the redeem script, not the outer P2SH scriptPubKey
+        sighash_script = Script(redeem_p2pkh)
+
+        def _script_sig(sig):
+            der = sig.serialize() + bytes([embit_script.SIGHASH_ALL])
+            chunk = lambda b: compact.to_bytes(len(b)) + b
+            return Script(chunk(der) + chunk(pubc) + chunk(redeem_p2pkh))
+
+    else:
+        raise ValueError("Zcash transparent quote address must be mainnet t1 or t3")
+
+    msg_hash = bip322_hash(message)
+    vin0 = TransactionInput(bytes(32), 0xFFFFFFFF, Script(bytes([0x00, 0x20]) + msg_hash), 0)
+    to_spend = Transaction(0, [vin0], [TransactionOutput(0, Script(spk))], 0)
+    unsigned = Transaction(
+        0, [TransactionInput(to_spend.txid(), 0, Script(b""), 0)], [TransactionOutput(0, Script(b"\x6a"))], 0
+    )
+    h = unsigned.sighash_legacy(0, sighash_script)
+    sig = pk.sign(h)
+    scr = _script_sig(sig)
+    signed = Transaction(
+        0, [TransactionInput(to_spend.txid(), 0, scr, 0)], [TransactionOutput(0, Script(b"\x6a"))], 0
+    )
+    return _b64.b64encode(signed.serialize()).decode("ascii")
+
+
 def sign_and_finalize(psbt_hex: str, key_bytes: bytes,
                       adaptor_key_bytes: Optional[bytes] = None,
-                      preimage: Optional[bytes] = None) -> Tuple[Optional[str], str]:
+                      preimage: Optional[bytes] = None,
+                      network: Optional[str] = None) -> Tuple[Optional[str], str]:
     """
     Sign a PSBT and finalize it into a raw transaction.
     For FAL hashlock lender claims, pass the 32-byte attestation preimage as ``preimage``.
+    ``network``: when ``bch`` or ``xec``, Taproot key-path inputs use BCH replay-protected
+    sighash (fork-id BIP143 digest + Schnorr witness ``sig || 0x41``), not BTC BIP-341 TapSighash.
     Returns (raw_tx_hex, txid) on success, or (None, error_msg).
     """
     tx, inputs = parse_psbt(bytes.fromhex(psbt_hex))
@@ -811,9 +1699,123 @@ def sign_and_finalize(psbt_hex: str, key_bytes: bytes,
     witnesses = {}
     signed = 0
 
+    # Embit tx for BIP-341 key-path sighash (funding PSBTs have no TAP_LEAF_SCRIPT entries)
+    embit_tx = None
+    if HAS_EMBIT:
+        try:
+            from embit.transaction import Transaction as EmbitTransaction
+            from embit.script import Script as EmbitScript
+            from embit.transaction import SIGHASH as EmbitSIGHASH
+
+            raw_unsigned = tx.raw()
+            embit_tx = EmbitTransaction.read_from(BytesIO(raw_unsigned))
+            _embit_script = EmbitScript
+            _embit_sighash = EmbitSIGHASH
+        except Exception as e:
+            embit_tx = None
+            _embit_script = None
+            _embit_sighash = None
+            print(f"  ⚠ Could not load tx for Taproot key-path sighash: {e}")
+    else:
+        _embit_script = None
+        _embit_sighash = None
+
+    net_key = normalize_signer_network(network or "") or ""
+    use_bch_replay_sighash = net_key in ("bch", "xec")
+
+    pk_for_key_path = PrivateKey(key_bytes)
+    my_pubkey_compressed = pk_for_key_path.get_public_key().sec()
+
     for idx, pinp in enumerate(inputs):
+        # ── Native SegWit v0 P2WPKH funding input (common for CoinPool top-ups) ──
+        p2wpkh_hash = _p2wpkh_hash_from_witness_utxo_spk(pinp.utxo_spk) if pinp.utxo_spk else None
+        if (
+            embit_tx is not None
+            and _embit_script is not None
+            and _embit_sighash is not None
+            and not pinp.leaves
+            and p2wpkh_hash is not None
+        ):
+            try:
+                from embit.hashes import hash160 as embit_hash160
+            except Exception as e:
+                return None, f"Could not load hash160 for P2WPKH signing: {e}"
+            if embit_hash160(my_pubkey_compressed) != p2wpkh_hash:
+                print(
+                    f"  · Input {idx}: P2WPKH — pubkey hash does not match this key "
+                    f"(expected …{p2wpkh_hash.hex()[-8:]})"
+                )
+                continue
+            try:
+                script_code = _embit_script(_p2pkh_scriptcode(p2wpkh_hash))
+                msg = embit_tx.sighash_segwit(
+                    idx, script_code, pinp.utxo_value, sighash=_embit_sighash.ALL
+                )
+            except Exception as e:
+                return None, f"P2WPKH sighash failed (input {idx}): {e}"
+            sig_obj = pk_for_key_path.sign(msg)
+            sig_bytes = sig_obj.serialize() if hasattr(sig_obj, "serialize") else bytes(sig_obj)
+            witnesses[idx] = [sig_bytes + b"\x01", my_pubkey_compressed]
+            signed += 1
+            print(f"  ✓ Input {idx}: P2WPKH signed (CoinPool top-up / wallet funding)")
+            continue
+
+        # ── Taproot key-path (P2TR spend with empty script tree — typical funding PSBT) ──
+        out_xonly = _p2tr_output_xonly_from_witness_utxo_spk(pinp.utxo_spk) if pinp.utxo_spk else None
+        if (
+            embit_tx is not None
+            and _embit_script is not None
+            and _embit_sighash is not None
+            and not pinp.leaves
+            and out_xonly is not None
+        ):
+            my_untweaked_xonly = pk_for_key_path.get_public_key().xonly()
+            my_tweaked_xonly = pk_for_key_path.get_public_key().taproot_tweak(b"").xonly()
+            if out_xonly == my_tweaked_xonly:
+                key_path_signer = pk_for_key_path.taproot_tweak(b"")
+                key_path_label = "BIP341 tweaked"
+            elif out_xonly == my_untweaked_xonly:
+                key_path_signer = pk_for_key_path
+                key_path_label = "untweaked CoinPool"
+            else:
+                print(
+                    f"  · Input {idx}: Taproot key-path — output key does not match this key "
+                    f"(expected output xonly …{out_xonly.hex()[-8:]}, "
+                    f"key gives tweaked …{my_tweaked_xonly.hex()[-8:]} / "
+                    f"untweaked …{my_untweaked_xonly.hex()[-8:]})"
+                )
+                continue
+            try:
+                for j, inp in enumerate(inputs):
+                    if not inp.utxo_spk or inp.utxo_value <= 0:
+                        raise ValueError(f"missing witness_utxo for input {j}")
+                if use_bch_replay_sighash:
+                    msg = bch_replay_signature_hash(
+                        tx, idx, pinp.utxo_spk, pinp.utxo_value, 0x00000041
+                    )
+                else:
+                    script_pubkeys = [_embit_script(i.utxo_spk) for i in inputs]
+                    values = [i.utxo_value for i in inputs]
+                    msg = embit_tx.sighash_taproot(
+                        idx, script_pubkeys, values, sighash=_embit_sighash.DEFAULT
+                    )
+            except Exception as e:
+                return None, f"Taproot key-path sighash failed (input {idx}): {e}"
+            sig_obj = key_path_signer.schnorr_sign(msg)
+            sig_bytes = sig_obj.serialize() if hasattr(sig_obj, "serialize") else bytes(sig_obj)
+            if use_bch_replay_sighash:
+                witnesses[idx] = [sig_bytes + b"\x41"]
+                print(
+                    f"  ✓ Input {idx}: Taproot key-path signed ({key_path_label}; BCH/XEC replay-protected sighash, witness …41)"
+                )
+            else:
+                witnesses[idx] = [sig_bytes]
+                print(f"  ✓ Input {idx}: Taproot key-path signed ({key_path_label}; funding / P2TR spend)")
+            signed += 1
+            continue
+
         if not pinp.leaves:
-            print(f"  · Input {idx}: no taproot leaf scripts — skipping")
+            print(f"  · Input {idx}: no taproot leaf scripts and not a key-path P2TR input — skipping")
             continue
 
         for cb, script, leaf_ver in pinp.leaves:
@@ -824,6 +1826,24 @@ def sign_and_finalize(psbt_hex: str, key_bytes: bytes,
             msg = sighash_script_path(tx, idx, inputs, lh)
             print(f"    leaf_hash: {lh.hex()[:24]}…")
             print(f"    sighash:   {msg.hex()[:24]}…")
+
+            if info['type'] == 'v2_claim':
+                recv_pk = info['receiver_pubkey']
+                completed = pinp.tap_script_sigs.get((recv_pk, lh))
+                if completed:
+                    witnesses[idx] = [completed, script, cb]
+                    signed += 1
+                    print(f"  ✓ Input {idx}: v2 claim finalized (pre-completed signature)")
+                    break
+                if my_xonly != recv_pk:
+                    return None, (
+                        f"Receiver key mismatch: script expects {recv_pk.hex()[:16]}…, "
+                        f"your key is {my_xonly.hex()[:16]}…"
+                    )
+                return None, (
+                    "v2 claim PSBT missing pre-completed signature — rebuild with "
+                    "build_v2_claim_psbt (recovery kit mode [C] on a v2 swap)"
+                )
 
             if info['type'] == 'claim':
                 adaptor_point = info['adaptor_point']
@@ -918,6 +1938,11 @@ def build_refund_psbt(kit: Dict, fee_rate: int = DEFAULT_FEE_RATE) -> Tuple[str,
     The PSBT has nLockTime = timeout.  It is valid to sign now but can only
     be broadcast once the Bitcoin network reaches the timeout block height.
     """
+    if _is_p2sh_htlc_dlc_a(kit):
+        raise ValueError(
+            "DLC A is a P2SH HTLC (BCH / XEC / RVN / ZEC hybrid). "
+            "Use recovery kit mode [R] — the signer builds a legacy transaction, not a Taproot PSBT."
+        )
     dlc = kit.get('dlc_a') or {}
     if not dlc.get('txid'):
         raise ValueError("DLC A not funded — nothing to refund")
@@ -939,11 +1964,11 @@ def build_refund_psbt(kit: Dict, fee_rate: int = DEFAULT_FEE_RATE) -> Tuple[str,
         if not desc.get(field):
             raise ValueError(f"Descriptor missing required field '{field}'")
 
-    scriptpubkey = bytes.fromhex(desc['scriptpubkey'])
-    refund_script = bytes.fromhex(desc['refund_script'])
-    refund_cb     = bytes.fromhex(desc['refund_control_block'])
-    internal_key  = bytes.fromhex(desc['internal_pubkey'])
-    merkle_root   = bytes.fromhex(desc['merkle_root'])
+    scriptpubkey = _hex_bytes(desc.get("scriptpubkey"), "scriptpubkey")
+    refund_script = _hex_bytes(desc.get("refund_script"), "refund_script")
+    refund_cb     = _hex_bytes(desc.get("refund_control_block"), "refund_control_block")
+    internal_key  = _hex_bytes(desc.get("internal_pubkey"), "internal_pubkey")
+    merkle_root   = _hex_bytes(desc.get("merkle_root"), "merkle_root")
     leaf_ver      = refund_cb[0] & 0xFE
 
     sender_addr = kit.get('user_address_from')
@@ -964,7 +1989,7 @@ def build_refund_psbt(kit: Dict, fee_rate: int = DEFAULT_FEE_RATE) -> Tuple[str,
     tx = Tx()
     tx.version = 2
     tx.locktime = timeout
-    tx.ins = [TxIn(bytes.fromhex(dlc['txid'])[::-1], vout, b'', LOCKTIME_SEQUENCE)]
+    tx.ins = [TxIn(_hex_bytes(dlc.get("txid"), "dlc_a.txid")[::-1], vout, b'', LOCKTIME_SEQUENCE)]
     tx.outs = [TxOut(output_value, sender_spk)]
 
     # PSBT
@@ -1011,11 +2036,11 @@ def build_claim_psbt(kit: Dict, fee_rate: int = DEFAULT_FEE_RATE) -> Tuple[str, 
         if not desc.get(field):
             raise ValueError(f"Descriptor missing required field '{field}'")
 
-    scriptpubkey = bytes.fromhex(desc['scriptpubkey'])
-    success_script = bytes.fromhex(desc['success_script'])
-    success_cb     = bytes.fromhex(desc['success_control_block'])
-    internal_key   = bytes.fromhex(desc['internal_pubkey'])
-    merkle_root    = bytes.fromhex(desc['merkle_root'])
+    scriptpubkey = _hex_bytes(desc.get("scriptpubkey"), "scriptpubkey")
+    success_script = _hex_bytes(desc.get("success_script"), "success_script")
+    success_cb     = _hex_bytes(desc.get("success_control_block"), "success_control_block")
+    internal_key   = _hex_bytes(desc.get("internal_pubkey"), "internal_pubkey")
+    merkle_root    = _hex_bytes(desc.get("merkle_root"), "merkle_root")
     leaf_ver       = success_cb[0] & 0xFE
 
     receiver_addr = kit.get('user_address_to')
@@ -1036,7 +2061,7 @@ def build_claim_psbt(kit: Dict, fee_rate: int = DEFAULT_FEE_RATE) -> Tuple[str, 
     tx = Tx()
     tx.version = 2
     tx.locktime = 0
-    tx.ins = [TxIn(bytes.fromhex(dlc['txid'])[::-1], vout, b'', LOCKTIME_SEQUENCE)]
+    tx.ins = [TxIn(_hex_bytes(dlc.get("txid"), "dlc_b.txid")[::-1], vout, b'', LOCKTIME_SEQUENCE)]
     tx.outs = [TxOut(output_value, receiver_spk)]
 
     # Pre-sign adaptor signature
@@ -1046,7 +2071,7 @@ def build_claim_psbt(kit: Dict, fee_rate: int = DEFAULT_FEE_RATE) -> Tuple[str, 
     temp_inp.utxo_spk = scriptpubkey
     sighash = sighash_script_path(tx, 0, [temp_inp], leaf_hash)
 
-    adaptor_key_bytes = bytes.fromhex(adaptor_secret_hex)
+    adaptor_key_bytes = _hex_bytes(adaptor_secret_hex, "adaptor_secret")
     adaptor_sig = schnorr_sign(adaptor_key_bytes, sighash)
     adaptor_xonly = PrivateKey(adaptor_key_bytes).get_public_key().xonly()
 
@@ -1061,13 +2086,170 @@ def build_claim_psbt(kit: Dict, fee_rate: int = DEFAULT_FEE_RATE) -> Tuple[str, 
     return build_psbt_bytes(tx, [psbt_input], 1).hex(), fee, output_value
 
 
+def _is_v2_kit(kit: Dict) -> bool:
+    if int(kit.get('protocol_version', 1)) == 2:
+        return True
+    desc = (kit.get('dlc_b') or {}).get('descriptor') or {}
+    return int(desc.get('version', 1)) == 2
+
+
+def _v2_expected_receiver_xonly(kit: Dict) -> bytes:
+    desc = (kit.get('dlc_b') or {}).get('descriptor') or {}
+    pk_hex = desc.get('receiver_pubkey') or ''
+    if not pk_hex:
+        eph = (kit.get('dlc_b_receiver_eph_pubkey') or kit.get('user_pubkey_to') or '').strip()
+        if len(eph) == 66 and eph[:2] in ('02', '03'):
+            pk_hex = eph[2:]
+    if not pk_hex:
+        raise ValueError("cannot determine DLC B receiver_pubkey from kit")
+    return _hex_bytes(pk_hex, 'receiver_pubkey')
+
+
+def build_v2_claim_psbt(
+    kit: Dict,
+    fee_rate: int = DEFAULT_FEE_RATE,
+    claim_privkey: Optional[bytes] = None,
+) -> Tuple[str, int, int]:
+    """
+    Build a Protocol v2 (adaptor-signature) claim PSBT from recovery-kit data.
+
+    v2 differs from the deprecated v1 claim: the claim leaf is a single ephemeral
+    receiver key (``<receiver> CHECKSIG``). We COMPLETE a BIP-340 adaptor
+    pre-signature with the adaptor secret ``t`` to produce the final Schnorr
+    signature, embed it as the single tap-script sig, and the existing finalize
+    path turns it into the witness ``[sig, claim_script, control_block]``.
+
+    Required kit fields (all client-held; the backend never has the ephemeral key
+    or t):
+      - dlc_b.descriptor: {claim_script, claim_control_block, scriptpubkey,
+                           internal_pubkey, merkle_root, adaptor_point}
+      - dlc_b.txid / vout / value
+      - receiver_ephemeral_privkey: 64-hex per-swap ephemeral claim key
+      - adaptor_secret OR revealed_secret: 64-hex t (the swap secret)
+      - user_address_to: destination
+
+    Returns (psbt_hex, fee, output_value).
+    """
+    dlc = kit.get('dlc_b') or {}
+    if not dlc.get('txid'):
+        raise ValueError("DLC B not funded — nothing to claim")
+    desc = dlc.get('descriptor') or {}
+
+    if int(desc.get('version', 1)) != 2:
+        raise ValueError("Not a v2 descriptor — use the v1 claim flow")
+
+    expected_recv = _v2_expected_receiver_xonly(kit)
+
+    eph_key = claim_privkey
+    if eph_key is None:
+        eph_hex = kit.get('receiver_ephemeral_privkey') or kit.get('ephemeral_privkey')
+        if eph_hex:
+            eph_key = _hex_bytes(eph_hex, 'receiver_ephemeral_privkey')
+    if eph_key is None:
+        raise ValueError(
+            "receiver_ephemeral_privkey missing from kit — when prompted, enter the "
+            "private key whose x-only pubkey matches DLC B receiver_pubkey "
+            f"({expected_recv.hex()[:16]}…). This may be your per-swap ephemeral key "
+            "OR your wallet key if the swap was created before ephemeral keys were enabled."
+        )
+    if PrivateKey(eph_key).get_public_key().xonly() != expected_recv:
+        raise ValueError(
+            f"claim private key does not match DLC B receiver_pubkey "
+            f"(expected {expected_recv.hex()[:16]}…)"
+        )
+
+    secret_hex = kit.get('adaptor_secret') or kit.get('revealed_secret')
+    if not secret_hex:
+        raise ValueError("adaptor secret (t) not available yet — wait for the counterparty "
+                         "to claim (revealing t) or use the holder's secret")
+    t_bytes = _hex_bytes(secret_hex, 'adaptor_secret')
+    T_hex = desc.get('adaptor_point') or kit.get('adaptor_point')
+    if T_hex:
+        T_bytes = _hex_bytes(T_hex, 'adaptor_point')
+    else:
+        # Secret-holder: T = t·G even if not yet published to the relay
+        T_bytes = adaptor_point_from_secret(t_bytes)
+
+    for field in ('scriptpubkey', 'claim_script', 'claim_control_block',
+                  'internal_pubkey', 'merkle_root'):
+        if not desc.get(field):
+            raise ValueError(f"v2 descriptor missing required field '{field}'")
+
+    scriptpubkey = _hex_bytes(desc.get("scriptpubkey"), "scriptpubkey")
+    claim_script = _hex_bytes(desc.get("claim_script"), "claim_script")
+    claim_cb     = _hex_bytes(desc.get("claim_control_block"), "claim_control_block")
+    internal_key = _hex_bytes(desc.get("internal_pubkey"), "internal_pubkey")
+    merkle_root  = _hex_bytes(desc.get("merkle_root"), "merkle_root")
+    leaf_ver     = claim_cb[0] & 0xFE
+
+    dlc_value = dlc.get('value') or kit.get('to_amount')
+    if not dlc_value:
+        raise ValueError("DLC B value unknown")
+    vout = dlc.get('vout') or 0
+
+    receiver_addr = kit.get('user_address_to')
+    if not receiver_addr:
+        raise ValueError("user_address_to missing from recovery kit")
+    receiver_spk = address_to_scriptpubkey(receiver_addr)
+
+    fee = TAPROOT_SCRIPT_VSIZE * fee_rate
+    output_value = dlc_value - fee
+    if output_value < 330:
+        fee = TAPROOT_SCRIPT_VSIZE
+        output_value = dlc_value - fee
+        if output_value < 330:
+            raise ValueError(f"DLC value ({dlc_value} sats) too small to cover fee")
+
+    tx = Tx()
+    tx.version = 2
+    tx.locktime = 0
+    tx.ins = [TxIn(_hex_bytes(dlc.get("txid"), "dlc_b.txid")[::-1], vout, b'', LOCKTIME_SEQUENCE)]
+    tx.outs = [TxOut(output_value, receiver_spk)]
+
+    leaf_hash = tap_leaf_hash(claim_script, leaf_ver)
+    temp_inp = PInput()
+    temp_inp.utxo_value = dlc_value
+    temp_inp.utxo_spk = scriptpubkey
+    sighash = sighash_script_path(tx, 0, [temp_inp], leaf_hash)
+
+    presig = adaptor_presign(eph_key, sighash, T_bytes)
+    completed_sig = adaptor_complete(presig, t_bytes)  # 64-byte BIP-340 sig
+    eph_xonly = PrivateKey(eph_key).get_public_key().xonly()
+
+    psbt_input = {
+        'witness_utxo': (dlc_value, scriptpubkey),
+        'tap_internal_key': internal_key,
+        'tap_merkle_root': merkle_root,
+        'tap_leaf_scripts': [(claim_cb, claim_script, leaf_ver)],
+        'tap_script_sigs': {(eph_xonly, leaf_hash): completed_sig},
+    }
+    return build_psbt_bytes(tx, [psbt_input], 1).hex(), fee, output_value
+
+
 # ═══════════════════════════════════════════════════════════════
 # Network helpers
 # ═══════════════════════════════════════════════════════════════
 
-def _broadcast_one(raw_hex: str, url: str) -> str:
+def _broadcast_one(raw_hex: str, url: str, network: str = "") -> str:
     """Broadcast to a single URL. Returns txid on success."""
-    r = httpx.post(url, content=raw_hex, headers={"Content-Type": "text/plain"}, timeout=30)
+    # Blockchair: POST form data=data (hex), JSON response with transaction_hash
+    if "api.blockchair.com" in url and "/push/transaction" in url:
+        r = httpx.post(url, data={"data": raw_hex}, timeout=60)
+        if r.status_code == 200:
+            j = r.json()
+            ctx = j.get("context") or {}
+            if ctx.get("code") not in (200, None) and ctx.get("error"):
+                raise RuntimeError(str(ctx.get("error", "broadcast failed")))
+            data_block = j.get("data") or {}
+            txid = (data_block.get("transaction_hash") or data_block.get("txid") or "").strip()
+            if not txid and isinstance(data_block, dict):
+                txid = (data_block.get("data") or {}).get("transaction_hash", "") or ""
+            if txid:
+                return txid
+            raise RuntimeError(f"Blockchair broadcast: {str(j)[:400]}")
+        raise RuntimeError(f"Broadcast failed ({r.status_code}): {r.text}")
+
+    r = httpx.post(url, content=raw_hex, headers={"Content-Type": "text/plain"}, timeout=60)
     if r.status_code == 200:
         # Blockbook /api/v2/sendtx/ returns JSON {"result":"<txid>"}; mempool returns plain txid
         body = r.text.strip()
@@ -1094,18 +2276,30 @@ def broadcast(raw_hex: str, network: str) -> str:
         urls = [os.environ["BEL_BROADCAST_URL"]] + [u for u in urls if u != os.environ["BEL_BROADCAST_URL"]]
     if network == "ltc" and os.environ.get("LTC_BROADCAST_URL"):
         urls = [os.environ["LTC_BROADCAST_URL"]] + [u for u in urls if u != os.environ["LTC_BROADCAST_URL"]]
-    last_err = None
+    if network == "bch" and os.environ.get("BCH_BROADCAST_URL"):
+        urls = [os.environ["BCH_BROADCAST_URL"]] + [u for u in urls if u != os.environ["BCH_BROADCAST_URL"]]
+    if network == "xec" and os.environ.get("XEC_BROADCAST_URL"):
+        urls = [os.environ["XEC_BROADCAST_URL"]] + [u for u in urls if u != os.environ["XEC_BROADCAST_URL"]]
+    if network == "rvn" and os.environ.get("RVN_BROADCAST_URL"):
+        urls = [os.environ["RVN_BROADCAST_URL"]] + [u for u in urls if u != os.environ["RVN_BROADCAST_URL"]]
+    last_err: Optional[BaseException] = None
+    errs: List[str] = []
     for url in urls:
         try:
-            return _broadcast_one(raw_hex, url)
+            return _broadcast_one(raw_hex, url, network)
         except Exception as e:
-            err_str = str(e)
             last_err = e
-            # Taproot rejection: try next endpoint
-            if "soft-fork" in err_str or "Witness version reserved" in err_str or "code 64" in err_str:
-                continue
-            raise
-    raise last_err or RuntimeError("Broadcast failed")
+            short = str(e).replace("\n", " ")
+            if len(short) > 180:
+                short = short[:177] + "..."
+            errs.append(f"{url}: {short}")
+            continue
+    detail = " | ".join(errs[:6])
+    if len(errs) > 6:
+        detail += f" | … (+{len(errs) - 6} more)"
+    raise RuntimeError(
+        f"Broadcast failed after {len(urls)} endpoint(s): {detail}"
+    ) from last_err
 
 
 def get_block_height(network: str) -> Optional[int]:
@@ -1114,6 +2308,12 @@ def get_block_height(network: str) -> Optional[int]:
         cfg = NETWORKS[network]
         r = httpx.get(cfg["height_url"], timeout=10)
         if r.status_code == 200:
+            if cfg.get("height_blockchair"):
+                data = r.json().get("data") or {}
+                h = data.get("best_block_height")
+                if h is None:
+                    h = data.get("blocks")
+                return int(h) if h is not None else None
             if cfg.get("height_json"):
                 data = r.json()
                 return int(data.get("blockbook", {}).get("bestHeight", 0))
@@ -1139,7 +2339,10 @@ def _do_broadcast(raw_hex: str, net: str):
         urls = NETWORKS[net].get("broadcast_urls") or [NETWORKS[net]["broadcast_url"]]
         print(f"    Broadcast manually:")
         for u in urls[:3]:
-            print(f"      curl -X POST {u} -d '<raw_hex>'")
+            if "api.blockchair.com" in u and "/push/transaction" in u:
+                print(f"      curl -sS -X POST '{u}' --data-urlencode 'data=<raw_hex>'")
+            else:
+                print(f"      curl -X POST {u} -d '<raw_hex>'")
         if net == "dgb":
             print(f"    Or set DGB_BROADCAST_URL to a Taproot-supporting endpoint (DigiByte Core 8.23+)")
         if net == "grs":
@@ -1148,6 +2351,20 @@ def _do_broadcast(raw_hex: str, net: str):
             print(f"    Or set BEL_BROADCAST_URL to another electrs-compatible /tx endpoint")
         if net == "ltc":
             print(f"    Or set LTC_BROADCAST_URL to another mempool-style /tx endpoint")
+        if net == "bch":
+            print(
+                "    Or set BCH_BROADCAST_URL (tried: Blockchair push/transaction, then BCExplorer /api/tx)"
+            )
+            print(
+                "    If the tx was signed with network=bch, Taproot key-path uses replay-protected (fork-id BIP143) sighash."
+                "\n    Persistent RPC -4 after that: verify witness_utxo scriptPubKey matches the chain UTXO, or use a BCH node wallet to sign."
+            )
+        if net == "xec":
+            print(f"    Or set XEC_BROADCAST_URL to another Blockchair-compatible ecash push/transaction URL")
+        if net == "rvn":
+            print(f"    Or set RVN_BROADCAST_URL to another Blockbook /api/v2/sendtx/ endpoint")
+        if net == "doge":
+            print(f"    Or set DOGE_BROADCAST_URL to another Blockchair-compatible dogecoin push/transaction URL")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1157,8 +2374,9 @@ def _do_broadcast(raw_hex: str, net: str):
 def mode_sign_psbt():
     """Interactive: sign an existing PSBT from hex."""
     # Network
-    print("\n[1] Network (btc / fb / ltc / bel / dgb / grs):")
+    print("\n[1] Network (btc / fb / ltc / bel / dgb / grs / bch / xec / rvn / zec / doge):")
     net = input("    > ").strip().lower()
+    net = normalize_signer_network(net)
     if net not in NETWORKS:
         print(f"  ✗ Unknown network '{net}'"); return
     print(f"    ✓ {NETWORKS[net]['name']}")
@@ -1236,7 +2454,9 @@ def mode_sign_psbt():
 
     # Sign
     print(f"\n[{step}] Signing…")
-    raw_hex, result = sign_and_finalize(psbt_hex, key_bytes, adaptor_bytes, preimage_bytes)
+    raw_hex, result = sign_and_finalize(
+        psbt_hex, key_bytes, adaptor_bytes, preimage_bytes, network=net
+    )
     if not raw_hex:
         print(f"\n  ✗ Failed: {result}"); return
 
@@ -1273,7 +2493,7 @@ def _load_kit() -> Optional[Dict]:
                 with open(path, 'r') as f:
                     kit = json.load(f)
                 print(f"    ✓ Loaded from {path}")
-                return kit
+                return _normalize_recovery_kit(kit)
             except Exception as e:
                 print(f"  ✗ Failed to read file: {e}"); return None
         else:
@@ -1290,7 +2510,7 @@ def _load_kit() -> Optional[Dict]:
     try:
         kit = json.loads('\n'.join(lines))
         print(f"    ✓ Parsed JSON")
-        return kit
+        return _normalize_recovery_kit(kit)
     except json.JSONDecodeError as e:
         print(f"  ✗ Invalid JSON: {e}"); return None
 
@@ -1325,8 +2545,20 @@ def _show_kit_summary(kit: Dict):
     else:
         print(f"    Funded: ✗  (not yet funded)")
 
-    has_secret = bool(kit.get('adaptor_secret'))
-    print(f"\n  Adaptor secret: {'✓ included' if has_secret else '✗ not included (not yet claim-eligible)'}")
+    if _is_v2_kit(kit):
+        print(f"\n  Protocol: v2 adaptor claim (single-key leaf)")
+        try:
+            rx = _v2_expected_receiver_xonly(kit).hex()
+            print(f"    DLC B receiver x-only: {rx[:20]}…")
+        except Exception:
+            pass
+        if kit.get('receiver_ephemeral_privkey') or kit.get('ephemeral_privkey'):
+            print(f"    Claim privkey in kit: ✓")
+        else:
+            print(f"    Claim privkey in kit: ✗ — you will be prompted for the matching private key")
+
+    has_secret = bool(kit.get('adaptor_secret') or kit.get('revealed_secret'))
+    print(f"  Adaptor secret t: {'✓ included' if has_secret else '✗ not included (not yet claim-eligible)'}")
     if kit.get('claim_eligibility_reason'):
         print(f"    {kit['claim_eligibility_reason']}")
 
@@ -1364,7 +2596,13 @@ def mode_recovery_kit():
     dlc_a = kit.get('dlc_a') or {}
     dlc_b = kit.get('dlc_b') or {}
     can_refund = bool(dlc_a.get('txid') and dlc_a.get('descriptor'))
-    can_claim  = bool(dlc_b.get('txid') and dlc_b.get('descriptor') and kit.get('adaptor_secret'))
+    if _is_v2_kit(kit):
+        can_claim = bool(
+            dlc_b.get('txid') and dlc_b.get('descriptor')
+            and (kit.get('adaptor_secret') or kit.get('revealed_secret'))
+        )
+    else:
+        can_claim = bool(dlc_b.get('txid') and dlc_b.get('descriptor') and kit.get('adaptor_secret'))
 
     if not can_refund and not can_claim and not has_pre_refund and not has_pre_claim:
         print("\n  No actions available:")
@@ -1397,12 +2635,12 @@ def mode_recovery_kit():
 
     # Pre-built PSBT paths
     if action == 'SR' and has_pre_refund:
-        net = kit.get('from_chain', 'btc').lower()
+        net = normalize_signer_network(kit.get('from_chain', 'btc'))
         print(f"\n    Using pre-built refund PSBT (network: {net.upper()})")
         _sign_and_broadcast(pre['refund_psbt_hex'], net, 'refund')
         return
     if action == 'SC' and has_pre_claim:
-        net = kit.get('to_chain', 'fb').lower()
+        net = normalize_signer_network(kit.get('to_chain', 'fb'))
         print(f"\n    Using pre-built claim PSBT (network: {net.upper()})")
         _sign_and_broadcast(pre['claim_psbt_hex'], net, 'claim')
         return
@@ -1418,8 +2656,85 @@ def mode_recovery_kit():
 
 def _build_sign_refund(kit: Dict):
     """Build refund PSBT from kit descriptor data, sign, broadcast."""
-    net = kit.get('from_chain', 'btc').lower()
-    timeout = kit.get('timeout_a') or (kit.get('dlc_a', {}).get('descriptor') or {}).get('timeout')
+    desc_a = (kit.get("dlc_a") or {}).get("descriptor") or {}
+    timeout = (
+        kit.get("timeout_a")
+        or desc_a.get("timeout")
+        or desc_a.get("cltv_height")
+    )
+
+    # ── Hybrid P2SH HTLC (BCH / XEC / RVN / ZEC): legacy ECDSA, not Taproot PSBT ──
+    if _is_p2sh_htlc_dlc_a(kit):
+        net = _p2sh_htlc_refund_network(kit)
+        use_bch = net in ("bch", "xec")
+
+        if HAS_HTTPX:
+            height = get_block_height(net)
+            if height:
+                print(f"\n    Current {net.upper()} block height: {height:,}")
+                if timeout and height < int(timeout):
+                    remaining = int(timeout) - height
+                    print(f"    ⚠ CLTV refund height {int(timeout):,} — {remaining:,} blocks away")
+                    print(f"      You can sign now, but broadcast will fail until chain height ≥ {int(timeout):,}")
+                else:
+                    print(f"    ✓ Chain height ≥ {int(timeout):,} — refund is broadcastable")
+        else:
+            print(f"\n    ℹ Install httpx to check block height (pip install httpx)")
+
+        print(f"\n[3] Fee rate in sat/byte for size estimate (default {DEFAULT_FEE_RATE}):")
+        fr = input("    > ").strip()
+        fee_rate = int(fr) if fr.isdigit() and int(fr) > 0 else DEFAULT_FEE_RATE
+
+        print(f"\n[4] Building P2SH HTLC refund transaction (legacy, not Taproot PSBT)…")
+        try:
+            tx, redeem, dlc_val, fee, out_val, net, bch_p2pkh_out = build_p2sh_htlc_refund_unsigned(kit, fee_rate)
+        except Exception as e:
+            print(f"  ✗ Build failed: {e}")
+            return
+
+        print(f"    ✓ Est. fee: ~{fee} sats (~{fee_rate} sat/byte × {P2SH_HTLC_REFUND_VSIZE} vB)")
+        print(f"    ✓ Output: {out_val:,} sats → {kit.get('user_address_from', '?')}")
+        if bch_p2pkh_out:
+            print(
+                "    ℹ Refund output uses **P2PKH** (standard BCH/eCash relay). "
+                "Same key as your Taproot CashAddr — spend with the same private key; "
+                "your wallet may show a `q…` / legacy-style address for this UTXO."
+            )
+        print(f"    ✓ nLockTime: {int(timeout)}  sighash: {'BCH replay (ALL|FORKID)' if use_bch else 'legacy ECDSA'}")
+        print(f"\n    Use the private key for the HTLC **sender** (refund) path — must match pubkey in redeem script.")
+
+        print(f"\n[5] Private key (WIF or 64-char hex):")
+        key_input = input("    > ").strip()
+        try:
+            key_bytes, _xo = parse_private_key(key_input)
+        except Exception as e:
+            print(f"  ✗ {e}")
+            return
+
+        print(f"\n[6] Signing…")
+        try:
+            raw_hex = sign_p2sh_htlc_refund_tx(tx, redeem, dlc_val, net, key_bytes)
+        except Exception as e:
+            print(f"  ✗ {e}")
+            return
+
+        txid_guess = hashlib.sha256(hashlib.sha256(bytes.fromhex(raw_hex)).digest()).digest()[::-1].hex()
+        print(f"\n{'─' * 60}")
+        print(f"  Signed refund transaction ({len(raw_hex) // 2} bytes)")
+        print(f"{'─' * 60}")
+        print(raw_hex)
+        print(f"{'─' * 60}")
+        print(f"  TXID (expected): {txid_guess}")
+
+        print(f"\n[7] Broadcast to {NETWORKS[net]['name']}? (y/n)")
+        if input("    > ").strip().lower() == "y":
+            _do_broadcast(raw_hex, net)
+        else:
+            print(f"    Skipped.")
+        return
+
+    # ── Taproot DLC A refund (standard PSBT) ──
+    net = normalize_signer_network(kit.get('from_chain', 'btc'))
 
     # Block height check
     if HAS_HTTPX:
@@ -1454,15 +2769,17 @@ def _build_sign_refund(kit: Dict):
 
 
 def _build_sign_claim(kit: Dict):
-    """Build claim PSBT from kit descriptor data (with adaptor), sign, broadcast."""
-    net = kit.get('to_chain', 'fb').lower()
+    """Build claim PSBT from kit descriptor data (v1 co-sign or v2 adaptor), finalize, broadcast."""
+    if _is_v2_kit(kit):
+        _build_sign_v2_claim(kit)
+        return
 
-    # Fee rate
+    net = normalize_signer_network(kit.get('to_chain', 'fb'))
+
     print(f"\n[3] Fee rate in sat/vB (default {DEFAULT_FEE_RATE}):")
     fr = input("    > ").strip()
     fee_rate = int(fr) if fr.isdigit() and int(fr) > 0 else DEFAULT_FEE_RATE
 
-    # Build
     print(f"\n[4] Building claim PSBT with pre-signed adaptor…")
     try:
         psbt_hex, fee, out_val = build_claim_psbt(kit, fee_rate)
@@ -1475,8 +2792,103 @@ def _build_sign_claim(kit: Dict):
     _sign_and_broadcast(psbt_hex, net, 'claim')
 
 
+def _build_sign_v2_claim(kit: Dict):
+    """v2 adaptor claim: complete signature locally, finalize 3-item witness, broadcast."""
+    net = normalize_signer_network(kit.get('to_chain', 'fb'))
+    try:
+        expected_recv = _v2_expected_receiver_xonly(kit)
+    except Exception as e:
+        print(f"  ✗ {e}"); return
+
+    print(f"\n    v2 claim — receiver x-only pubkey: {expected_recv.hex()[:16]}…")
+    print(f"    (Must match the private key you enter below.)")
+
+    claim_privkey = None
+    if not (kit.get('receiver_ephemeral_privkey') or kit.get('ephemeral_privkey')):
+        print(f"\n[3] Claim private key (WIF or 64-char hex) — NOT your DGB funding key:")
+        print(f"    This is the key for FB claim leg receiver_pubkey above.")
+        print(f"    Use the ephemeral key from your Recovery Kit, or your FB wallet key if")
+        print(f"    that pubkey matches your UniSat/OKX FB Taproot key.")
+        key_input = input("    > ").strip()
+        try:
+            claim_privkey, my_x = parse_private_key(key_input)
+            if my_x != expected_recv:
+                print(f"  ✗ Key mismatch: yours {my_x.hex()[:16]}… expected {expected_recv.hex()[:16]}…")
+                return
+            print(f"    ✓ Key matches receiver_pubkey")
+        except Exception as e:
+            print(f"  ✗ {e}"); return
+        fr_step = "[4]"
+        build_step = "[5]"
+        broadcast_step = "[6]"
+    else:
+        fr_step = "[3]"
+        build_step = "[4]"
+        broadcast_step = "[5]"
+
+    print(f"\n{fr_step} Fee rate in sat/vB (default {DEFAULT_FEE_RATE}):")
+    fr = input("    > ").strip()
+    fee_rate = int(fr) if fr.isdigit() and int(fr) > 0 else DEFAULT_FEE_RATE
+
+    print(f"\n{build_step} Building v2 adaptor claim (presign → complete → embed sig)…")
+    try:
+        psbt_hex, fee, out_val = build_v2_claim_psbt(kit, fee_rate, claim_privkey=claim_privkey)
+        print(f"    ✓ Fee: {fee} sats ({fee_rate} sat/vB)")
+        print(f"    ✓ Output: {out_val:,} sats → {kit.get('user_address_to', '?')}")
+        print(f"    ✓ Completed BIP-340 signature embedded in PSBT")
+    except Exception as e:
+        print(f"  ✗ Build failed: {e}"); return
+
+    print(f"\n{build_step}b Finalizing signed transaction…")
+    raw_hex, result = finalize_presigned_v2_psbt(psbt_hex)
+    if not raw_hex:
+        print(f"  ✗ Finalize failed: {result}"); return
+
+    print(f"\n{'─' * 60}")
+    print(f"  Signed v2 claim transaction ({len(raw_hex) // 2} bytes)")
+    print(f"{'─' * 60}")
+    print(raw_hex)
+    print(f"{'─' * 60}")
+    print(f"  TXID: {result}")
+
+    print(f"\n{broadcast_step} Broadcast to {NETWORKS[net]['name']}? (y/n)")
+    if input("    > ").strip().lower() == 'y':
+        _do_broadcast(raw_hex, net)
+    else:
+        print("    Skipped. Broadcast manually or via the bridge finalize endpoint.")
+
+
+def finalize_presigned_v2_psbt(psbt_hex: str) -> Tuple[Optional[str], str]:
+    """Finalize a v2 claim PSBT that already has the completed tapscript signature."""
+    tx, inputs = parse_psbt(bytes.fromhex(psbt_hex))
+    witnesses = {}
+    signed = 0
+    for idx, pinp in enumerate(inputs):
+        for cb, script, leaf_ver in pinp.leaves:
+            info = analyze_script(script)
+            if info.get('type') != 'v2_claim':
+                continue
+            lh = tap_leaf_hash(script, leaf_ver)
+            recv_pk = info['receiver_pubkey']
+            sig = pinp.tap_script_sigs.get((recv_pk, lh))
+            if not sig:
+                return None, "PSBT missing completed v2 claim signature"
+            witnesses[idx] = [sig, script, cb]
+            signed += 1
+            break
+    if signed == 0:
+        return None, "No v2 claim leaf found in PSBT"
+    raw_tx = tx.raw(witnesses)
+    txid = hashlib.sha256(hashlib.sha256(tx.raw()).digest()).digest()[::-1].hex()
+    return raw_tx.hex(), txid
+
+
 def _sign_and_broadcast(psbt_hex: str, net: str, action_type: str):
     """Parse → show analysis → get key → sign → optionally broadcast."""
+    net = normalize_signer_network(net)
+    if net not in NETWORKS:
+        print(f"  ✗ Unknown network '{net}' — use btc, fb, ltc, bel, dgb, grs, bch, xec, rvn, zec, or doge")
+        return
     # Quick analysis
     try:
         tx, inputs = parse_psbt(bytes.fromhex(psbt_hex))
@@ -1506,7 +2918,7 @@ def _sign_and_broadcast(psbt_hex: str, net: str, action_type: str):
 
     # Sign
     print(f"\n[6] Signing…")
-    raw_hex, result = sign_and_finalize(psbt_hex, key_bytes)
+    raw_hex, result = sign_and_finalize(psbt_hex, key_bytes, network=net)
     if not raw_hex:
         print(f"\n  ✗ Failed: {result}"); return
 
@@ -1531,7 +2943,7 @@ def _sign_and_broadcast(psbt_hex: str, net: str, action_type: str):
 # ═══════════════════════════════════════════════════════════════
 
 def mode_sign_bip322():
-    """Sign a BIP-322 message for Taproot (P2TR) address. Usage: python signer.py sign-bip322 <message>"""
+    """Sign a BIP-322 message (Taproot simple witness, or Zcash transparent full-tx). Usage: python signer.py sign-bip322 <message>"""
     if len(sys.argv) < 3:
         print("Usage: python signer.py sign-bip322 <message>")
         print("  Message is the exact string to sign (e.g. addrFrom|addrTo|hCommit|ts)")
@@ -1539,22 +2951,21 @@ def mode_sign_bip322():
     message = " ".join(sys.argv[2:])  # Allow message with spaces
     print(f"\n  BIP-322 sign mode")
     print(f"  Message ({len(message)} chars): {message[:60]}{'…' if len(message) > 60 else ''}")
-    print(f"\n  Taproot address (dgb1... / grs1... / ltc1... / bel1... / bc1p...):")
+    print(f"\n  Address (Taproot: dgb1 / grs1 / ltc1 / bel1 / rvn1 / doge1 / ecash / bitcoincash / bc1p — or Zcash transparent t1 / t3):")
     addr = input("    > ").strip()
     print(f"\n  Private key (WIF or 64-char hex):")
     key_input = input("    > ").strip()
-    try:
-        scriptpubkey = address_to_scriptpubkey(addr)
-    except Exception as e:
-        print(f"  ✗ Invalid address: {e}")
-        sys.exit(1)
     try:
         key_bytes, _ = parse_private_key(key_input)
     except Exception as e:
         print(f"  ✗ Invalid key: {e}")
         sys.exit(1)
     try:
-        sig_b64 = sign_bip322_message(message, key_bytes, scriptpubkey)
+        if addr.startswith("t1") or addr.startswith("t3"):
+            sig_b64 = sign_bip322_zec_transparent(message, key_bytes, addr)
+        else:
+            scriptpubkey = address_to_scriptpubkey(addr)
+            sig_b64 = sign_bip322_message(message, key_bytes, scriptpubkey)
         print(f"\n  Signature (base64):")
         print(sig_b64)
     except Exception as e:
@@ -1688,6 +3099,96 @@ def mode_derive_bel():
         sys.exit(1)
 
 
+def mode_derive_bch():
+    """Derive BCH Taproot CashAddr from private key. Usage: python signer.py derive-bch"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    if not HAS_BCH_CASHADDR:
+        print("✗ bitcash required for BCH: pip install bitcash")
+        sys.exit(1)
+    print("\n  Derive Bitcoin Cash (Taproot / CashAddr) address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_bch_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
+def mode_derive_xec():
+    """Derive eCash Taproot CashAddr from private key. Usage: python signer.py derive-xec"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    if not HAS_BCH_CASHADDR:
+        print("✗ bitcash required for XEC: pip install bitcash")
+        sys.exit(1)
+    print("\n  Derive eCash (Taproot / ecash: CashAddr) address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_xec_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
+def mode_derive_rvn():
+    """Derive Ravencoin Taproot address from private key. Usage: python signer.py derive-rvn"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    print("\n  Derive Ravencoin (Taproot / rvn1) address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_rvn_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
+def mode_derive_doge():
+    """Derive Dogecoin Taproot address from private key. Usage: python signer.py derive-doge"""
+    if not HAS_EMBIT:
+        print("✗ embit required: pip install embit")
+        sys.exit(1)
+    if not HAS_BASE58:
+        print("✗ base58 required: pip install base58")
+        sys.exit(1)
+    print("\n  Derive Dogecoin (Taproot / doge1) address from private key")
+    print("  Private key (WIF or 64-char hex):")
+    key_input = input("    > ").strip()
+    try:
+        address, xonly_hex, compressed_hex = derive_doge_from_private_key(key_input)
+        print(f"\n  Address:  {address}")
+        print(f"  Pubkey (x-only, 64 hex):  {xonly_hex}")
+        print(f"  Pubkey (compressed, 66 hex):  {compressed_hex}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+        sys.exit(1)
+
+
 def main():
     # CLI mode: python signer.py derive-btc / derive-fb / derive-dgb / etc.
     if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-btc":
@@ -1707,6 +3208,18 @@ def main():
         return
     if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-bel":
         mode_derive_bel()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-bch":
+        mode_derive_bch()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-xec":
+        mode_derive_xec()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-rvn":
+        mode_derive_rvn()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == "derive-doge":
+        mode_derive_doge()
         return
     # CLI mode: python signer.py sign-bip322 <message>
     if len(sys.argv) >= 2 and sys.argv[1].lower() == "sign-bip322":
@@ -1748,6 +3261,10 @@ def main():
     print("    [7] Derive GRS Taproot address from private key")
     print("    [8] Derive LTC Taproot address from private key")
     print("    [9] Derive BEL Taproot address from private key")
+    print("    [10] Derive BCH Taproot (CashAddr) address from private key")
+    print("    [11] Derive XEC Taproot (ecash: CashAddr) address from private key")
+    print("    [12] Derive RVN Taproot (rvn1) address from private key")
+    print("    [13] Derive DOGE Taproot (doge1) address from private key")
 
     mode = input("\n  > ").strip()
     if mode == '1':
@@ -1769,6 +3286,14 @@ def main():
         mode_derive_ltc()
     elif mode == '9':
         mode_derive_bel()
+    elif mode == '10':
+        mode_derive_bch()
+    elif mode == '11':
+        mode_derive_xec()
+    elif mode == '12':
+        mode_derive_rvn()
+    elif mode == '13':
+        mode_derive_doge()
     else:
         print(f"  ✗ Unknown mode '{mode}'")
 
