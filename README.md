@@ -5,7 +5,7 @@
 <h1 align="center">NexumBit Protocol</h1>
 <p align="center">
   <strong>Taproot-native cross-chain atomic swaps &amp; lending</strong><br>
-  <strong>Protocol v1 -> v2</strong> — genuine BIP-340 adaptor signatures on P2TR<br>
+  <strong>Protocol v2</strong> — genuine BIP-340 adaptor signatures on P2TR<br>
   <strong>Bitcoin ↔ Fractal Bitcoin</strong> (primary swap pair in this specification)
 </p>
 
@@ -137,6 +137,11 @@ NexumBit **never** stores wallet private keys or ephemeral claim keys on the ser
   - [BIP-340 Construction](#bip-340-construction)
   - [Why This Is Atomic](#why-this-is-atomic)
   - [What the Coordinator Stores](#what-the-coordinator-stores)
+- [Privacy Model (v2)](#privacy-model-v2)
+  - [Compared to HTLC bridges](#compared-to-htlc-bridges)
+  - [What stays private](#what-stays-private)
+  - [What becomes public](#what-becomes-public)
+  - [Linkability & limits](#linkability--limits)
 - [Timelock Security Model](#timelock-security-model)
   - [Funding order & timeouts](#funding-order--timeouts)
   - [Attack Prevention](#attack-prevention)
@@ -166,7 +171,7 @@ The protocol uses **Discreet Log Contracts (DLCs)** built on **Taproot (P2TR)** 
 | **Non-custodial** | Funds locked in on-chain Taproot script paths; coordinator never holds claim keys or `t` |
 | **Atomic** | BIP-340 adaptor presign / complete / extract links both legs cryptographically |
 | **Trust-minimized** | Script enforces spend rules; coordinator is replaceable (worst case: DoS / bad relay data) |
-| **On-chain revelation** | First claim broadcasts completed Schnorr `s`; counterparty extracts `t = s − s' (mod n)` |
+| **Privacy** | No HTLC-style preimage in witness; adaptor `T`/`t` off-script — see [Privacy Model (v2)](#privacy-model-v2) |
 | **Recoverable** | Timelock refund paths + offline [`Signer/`](Signer/README.md) recovery kit |
 
 ---
@@ -479,6 +484,62 @@ Both legs share the same adaptor point `T = t·G`. When the secret-holder broadc
 | `revealed_secret` | Public once on-chain |
 | `adaptor_secret` | **Not stored** for v2 swaps |
 | `receiver_ephemeral_privkey` | **Not stored** — client-side only |
+
+---
+
+## Privacy Model (v2)
+
+Protocol v2 trades **HTLC-style preimage privacy** for **cryptographic atomicity**. Be precise about what is and is not hidden.
+
+### Honest summary
+
+- **After the first claim**, adaptor secret `t` is **derivable from public chain data** by anyone who also has the matching pre-signature `(R', s')` (relayed pre-funding, or recovered from the coordinator).
+- **Before the first claim**, `t` stays with the secret-holder only; a public pre-signature alone cannot complete a claim.
+- v2 does **not** hide that a swap occurred: funding outputs, claim spends, amounts, and timing remain visible to chain analysis.
+
+The deprecated v1 line *“adaptor secrets never appear on-chain”* was **incorrect for real cross-chain atomicity** — v1 did not reveal a usable secret to the counterparty either, because it was not a true adaptor signature.
+
+### Compared to HTLC bridges
+
+| | HTLC (classic) | NexumBit v2 |
+|---|---|---|
+| On-chain witness | `OP_HASH160` + **preimage in cleartext** | Single **64-byte BIP-340 Schnorr** signature |
+| Secret in Tapscript? | Yes — hash commitment | **No** — claim leaf is `<receiver> CHECKSIG` only |
+| Adaptor point `T` in script? | N/A (hashlock) | **No** — `T` is off-chain for presign/complete |
+| Atomic link | Same preimage reused across chains | `t` extracted from signature algebra: `t = s − s' (mod n)` |
+| Chain observer sees | Distinct hashlock pattern + revealed preimage | Ordinary Taproot script-path spend |
+
+**Privacy win vs HTLC:** no hashlock opcode trail and no preimage pushed in the witness stack.
+
+**Privacy limit vs HTLC:** `t` still becomes knowable once a claim confirms — it is embedded in the completed Schnorr signature, not absent from the security model.
+
+### What stays private
+
+| Material | On-chain? | Coordinator? |
+|---|---|---|
+| Wallet private keys (fund / refund) | Never | Never |
+| Ephemeral claim scalars (`d`) | Never — only x-only pubkey in claim leaf | **Never stored** |
+| Adaptor secret `t` (pre-claim) | Not in script; not in witness until completed sig | **Not stored** (swaps) |
+| Pre-signature without `t` | Not on-chain until claim | Public relay — **cannot spend** |
+
+Per-swap **ephemeral claim keys** are not your wallet's Taproot key — they limit cross-swap signature linkage to the same on-chain identity.
+
+### What becomes public
+
+| Material | When |
+|---|---|
+| `T = t·G` | Secret-holder publishes to relay after both legs funded |
+| Pre-signatures `(R', s')` | Exchanged via coordinator (verified, stored) |
+| Completed Schnorr signature `s` | First claim broadcast → **`t` extractable** by counterparty (and anyone with `s'`) |
+| `revealed_secret` | Stored on relay / recovery kit after on-chain claim |
+| Cross-swap linkage | Matched swaps share `T` and cross-referenced DLC addresses (see [Cross-Swap Data Linking](#cross-swap-data-linking)) |
+
+### Linkability & limits
+
+- **NUMS internal key** (per-DLC tweak) — key-path spend is impossible; v1's derived spendable internal key is removed, so outputs cannot be linked via a shared internal spend key.
+- **Chain analysis** can still correlate both legs by timing, amounts, coordinator match metadata, and the **shared adaptor point** `T` across the pair.
+- **Taproot** hides the unused script path at spend time (only the taken leaf is revealed in the witness), but the spend still exposes which path was used (claim vs refund).
+- **Lending:** collateral repay uses the same single-key + adaptor-complete witness shape; `t` release is **server-gated** until repayment is confirmed — different policy, same on-chain appearance at claim time.
 
 ---
 
