@@ -740,7 +740,7 @@ Protocol v1 (`dlc_builder.build_dlc`) used:
 
 The coordinator pre-signed using the adaptor secret as a **normal** private key. That is **not** a BIP-340 adaptor signature; atomicity was **coordinator-enforced**, not cryptographic. Secrets were described as "never on-chain" but the construction did not provide real cross-chain extraction.
 
-**v1 is disabled for new swaps** when `ADAPTOR_SIG_V2_ENABLED=true`. Legacy reference: [`dlc_builder/README.md`](dlc_builder/README.md).
+**v1 is disabled for new swaps** on NexumBit. Depracted Code will be deleted soon. Legacy reference: [`dlc_builder/README.md`](dlc_builder/README.md).
 
 ---
 
