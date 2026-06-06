@@ -2,29 +2,58 @@
 Lending-specific Tapscript leaf builders for 3-leaf collateral DLCs.
 
 Three leaves:
-  1. Repay   – adaptor + borrower (identical structure to swap success script)
-  2. Lender Claim – oracle + lender  (new: oracle co-signs liquidation/default)
-  3. Safety Refund – CLTV + borrower  (identical structure to swap refund script)
-
-All use the existing Script class from script_builder.py.
-No changes to the existing swap scripts.
+  1. Repay   – v2: single borrower key + off-chain BIP-340 adaptor (default)
+  2. Lender Claim – oracle + lender / FAL hashlock / fixed-term CLTV
+  3. Safety Refund – CLTV + borrower
 """
 import logging
+from typing import Optional
+
 from .script_builder import Script
 
 logger = logging.getLogger(__name__)
 
 
+def fal_hashlock_commitment_from_script(script: bytes) -> Optional[bytes]:
+    """
+    Parse the 32-byte hash commitment H from an FAL lender-claim hashlock tapscript
+    (OP_SHA256 <H> OP_EQUALVERIFY <lender> OP_CHECKSIG). Returns None if layout does not match.
+    """
+    if (
+        len(script) == 69
+        and script[0] == 0xA8
+        and script[1] == 0x20
+        and script[34] == 0x88
+        and script[35] == 0x20
+        and script[68] == 0xAC
+    ):
+        return script[2:34]
+    return None
+
+
+def build_lending_v2_repay_script(borrower_pubkey: bytes) -> bytes:
+    """
+    v2 collateral repay leaf — single borrower (or ephemeral repay) key.
+
+    Script: <borrower_xonly> OP_CHECKSIG
+
+    Atomicity for repay is server-gated (adaptor secret released only after
+    confirmed repayment), but completion uses a real BIP-340 adaptor signature —
+    not v1 2-of-2 co-sign.
+    """
+    if len(borrower_pubkey) != 32:
+        raise ValueError(f"borrower_pubkey must be 32 bytes (x-only), got {len(borrower_pubkey)}")
+    s = Script()
+    s.push_data(borrower_pubkey)
+    s.op(Script.OP_CHECKSIG)
+    return s.to_bytes()
+
+
 def build_repay_script(adaptor_point_xonly: bytes, borrower_pubkey: bytes) -> bytes:
     """
-    Leaf 1 — Borrower reclaims collateral after repayment.
+    **Deprecated v1** repay leaf (2-of-2 co-sign). Use ``build_lending_v2_repay_script``.
 
     Script: <adaptor_xonly> OP_CHECKSIGVERIFY <borrower_xonly> OP_CHECKSIG
-
-    Witness: <adaptor_sig> <borrower_sig>
-
-    Server pre-signs with the adaptor secret only after confirming
-    on-chain repayment with deep confirmations.
     """
     if len(adaptor_point_xonly) != 32:
         raise ValueError(f"adaptor_point_xonly must be 32 bytes (x-only), got {len(adaptor_point_xonly)}")

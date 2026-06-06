@@ -2,24 +2,33 @@
 
 This document describes **what must appear in the witness** to spend the **collateral** output along each **script path**. It matches `lending_scripts.py` in this package.
 
-For **Taproot script-path** spends (BIP-341 / BIP-342), the full transaction witness typically includes, **in addition** to the items below, the **tapscript** and **control block** (see `LendingDLCDescriptor` fields: `repay_script`, `lender_claim_script`, `safety_script`, and corresponding `*_control_block`). Wallet / PSBT tooling usually attaches those; integrators should use the **descriptor** returned by `build_collateral_dlc(...)`.
+For **Taproot script-path** spends (BIP-341 / BIP-342), the full transaction witness typically includes, **in addition** to the items below, the **tapscript** and **control block** (see `LendingDLCDescriptor` fields: `repay_script`, `lender_claim_script`, `safety_script`, and corresponding `*_control_block`).
 
-**Notation:** *Stack bottom → top* is the order values are **consumed** by the script (bottom first), consistent with the inline comments in `lending_scripts.py`. Schnorr **signatures** are **64-byte** (x-only, BIP-340) unless your stack uses 65-byte encodings — follow your signer.
+**Notation:** *Stack bottom → top* is the order values are **consumed** by the script. Schnorr signatures are **64-byte** BIP-340 unless your signer uses another encoding.
+
+**Protocol version:** `build_collateral_dlc(..., protocol_version=2)` is the default. v1 repay witness is documented in [Deprecated v1 repay](#deprecated-v1-repay) below.
 
 ---
 
-## 1. Repay leaf
+## 1. Repay leaf (v2 — default)
 
-**Script shape:** `<adaptor_xonly> OP_CHECKSIGVERIFY <borrower_xonly> OP_CHECKSIG`
+**Script shape:** `<repay_xonly> OP_CHECKSIG`
+
+`repay_xonly` is `repay_pubkey` in the descriptor (may be an ephemeral browser key, not the borrower's wallet key).
 
 | Stack (bottom → top) | Role |
 |----------------------|------|
-| `adaptor_sig` | Schnorr signature for the internal/adaptor path (VERIFY) |
-| `borrower_sig` | Borrower signature for `OP_CHECKSIG` |
+| `completed_schnorr_sig` | BIP-340 signature = `adaptorComplete(presig, t)` under the repay key |
 
-**Transaction:** `nLockTime` / height locks are not required by this leaf itself beyond what your protocol adds elsewhere.
+**Off-chain (not in witness stack items above):**
 
-**Operational note:** Who holds the adaptor secret and when it is released is **protocol policy**, not encoded in this file.
+1. Borrower (or server on borrower's behalf) holds a **claim pre-signature** `(R', s')` over the repay sighash.
+2. Server releases adaptor secret `t` only after **confirmed on-chain loan repayment**.
+3. Client completes: standard 64-byte Schnorr valid under `repay_xonly`.
+
+Adaptor math: [`dlc_v2_builder/adaptor_sig.py`](../dlc_v2_builder/adaptor_sig.py) and [`Signer/signer.py`](../Signer/signer.py).
+
+**Operational note:** Server-gated `t` release is **protocol policy**, not encoded in the script.
 
 ---
 
@@ -36,10 +45,6 @@ Only **one** of these is compiled into a given output; chosen by `attestation_mo
 | `oracle_sig` | Oracle attestation signature (VERIFY) |
 | `lender_sig` | Lender signature |
 
-The oracle must sign the **correct Taproot script-path sighash** for this input (same leaf hash / control block your PSBT uses). **When** the oracle signs (liquidation, expiry, etc.) is **off-chain policy**.
-
----
-
 ### 2b. `fixed_term` mode
 
 **Script shape:** `<height> OP_CHECKLOCKTIMEVERIFY OP_DROP <lender_xonly> OP_CHECKSIG`
@@ -48,24 +53,16 @@ The oracle must sign the **correct Taproot script-path sighash** for this input 
 |----------------------|------|
 | `lender_sig` | Single Schnorr signature |
 
-**Transaction:** `nLockTime` (or input’s sequence / locktime semantics) must satisfy **`>= lender_claim_cltv_height`** passed into `build_collateral_dlc` (absolute height per script). Wallets must set transaction lock time accordingly.
-
----
+**Transaction:** `nLockTime` **≥ `lender_claim_cltv_height`**.
 
 ### 2c. `fal` mode (hashlock)
 
 **Script shape:** `OP_SHA256 <h_32> OP_EQUALVERIFY <lender_xonly> OP_CHECKSIG`
 
-Per-source comment: *Witness (bottom→top): 64-byte `lender_sig` · 32-byte `preimage`*
-
 | Stack (bottom → top) | Role |
 |----------------------|------|
 | `lender_sig` | Lender Schnorr signature |
-| `preimage` | 32 bytes such that `SHA256(preimage)` equals the **32-byte hash** committed in-script (from `attestation_hash_hex` — the **hash** of the secret, not the secret committed elsewhere on FB) |
-
-**Check:** The pushed hash in-script is the **32-byte value** used in `OP_EQUALVERIFY` after `OP_SHA256` hashes the preimage — i.e. script verifies `SHA256(preimage) == H` where `H` is embedded as `<h_32>` in the script (implementation uses the attestation hash commitment as binding; see `builder.py`).
-
-**Operational note:** **How** the preimage becomes available (e.g. Fractal covenant reveal) is **outside** this library — see product backend / runbooks.
+| `preimage` | 32 bytes where `SHA256(preimage) == H` (committed in-script) |
 
 ---
 
@@ -75,17 +72,17 @@ Per-source comment: *Witness (bottom→top): 64-byte `lender_sig` · 32-byte `pr
 
 | Stack (bottom → top) | Role |
 |----------------------|------|
-| `borrower_sig` | Borrower signature |
+| `borrower_sig` | Borrower **wallet** signature |
 
-**Transaction:** `nLockTime` **≥ `safety_timeout`** (absolute block height in the script). This is the long **borrower-only** escape hatch after the agreed timeout.
+**Transaction:** `nLockTime` **≥ `safety_timeout`**.
 
 ---
 
-## Summary table
+## Summary table (v2)
 
 | Leaf | Modes | Witness stack (bottom → top) |
 |------|--------|------------------------------|
-| Repay | all | `adaptor_sig`, `borrower_sig` |
+| Repay | v2 (default) | `completed_schnorr_sig` |
 | Lender claim | `oracle` | `oracle_sig`, `lender_sig` |
 | Lender claim | `fixed_term` | `lender_sig` (+ locktime ≥ CLTV height) |
 | Lender claim | `fal` | `lender_sig`, `preimage` |
@@ -93,12 +90,31 @@ Per-source comment: *Witness (bottom→top): 64-byte `lender_sig` · 32-byte `pr
 
 ---
 
-## References
+## Deprecated v1 repay
 
-- [BIP-341 — Taproot](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki)  
-- [BIP-342 — Tapscript](https://github.com/bitcoin/bips/blob/master/bip-0342.mediawiki)  
-- [Bitcoin Optech — Taproot](https://bitcoinops.org/en/topics/taproot/)  
+`protocol_version=1` only (reference):
+
+**Script shape:** `<adaptor_xonly> OP_CHECKSIGVERIFY <borrower_xonly> OP_CHECKSIG`
+
+| Stack (bottom → top) | Role |
+|----------------------|------|
+| `adaptor_sig` | Coordinator co-sign (not real BIP-340 adaptor) |
+| `borrower_sig` | Borrower signature |
 
 ---
 
-*For integration testing, build a descriptor with `build_collateral_dlc`, construct a PSBT spending the relevant leaf, and verify your signer produces signatures that validate against the script and sighash.*
+## Loan delivery DLC (separate output)
+
+The **loan delivery** leg is a **2-leaf v2 DLC** built with `dlc_v2_builder.build_dlc_v2` (not this package). Claim witness matches swap v2:
+
+| Stack (bottom → top) | Role |
+|----------------------|------|
+| `completed_schnorr_sig` | Adaptor-completed claim under borrower's ephemeral key |
+
+---
+
+## References
+
+- [BIP-341 — Taproot](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki)
+- [BIP-342 — Tapscript](https://github.com/bitcoin/bips/blob/master/bip-0342.mediawiki)
+- [`dlc_v2_builder/README.md`](../dlc_v2_builder/README.md)
