@@ -127,6 +127,7 @@ NexumBit **never** stores wallet private keys or ephemeral claim keys on the ser
   - [Happy Path — Step by Step](#happy-path--step-by-step)
   - [Sequence Diagram](#sequence-diagram)
   - [Role assignment](#role-assignment)
+  - [Funding order — who goes first](#funding-order--who-goes-first)
 - [On-Chain Construction (v2)](#on-chain-construction-v2)
   - [Taproot Script Tree](#taproot-script-tree)
   - [Claim Script (Success Path)](#claim-script-success-path)
@@ -323,6 +324,26 @@ sequenceDiagram
 - **Leg B** = User B's funded output (claimed by A's ephemeral key).
 - **First-claimed leg** = whichever has the **earlier** refund unlock (after grace).
 - **Secret-holder** = receiver of the first-claimed leg → generates and holds `t` until claim.
+
+### Funding order — who goes first
+
+At match, timelocks decide roles. The party whose leg has the **earlier refund unlock** becomes the **secret-holder**. That same party must **fund first**; the counterparty **waits** until the holder's fund transaction is visible on-chain.
+
+| Role | Funds when | Waits for |
+|------|------------|-----------|
+| **Secret-holder** | **First** — fund your send leg immediately after match | Counterparty to fund their send leg + both chains to confirm |
+| **Second claimer** (follower) | **Second** — only after holder's fund tx is on-chain | Holder's fund tx before you can fund; holder's **claim** before you can claim |
+
+**Why this order matters (security):**
+
+Without holder-funds-first, the second party could lock funds while the holder never funds — then only the follower has coins at risk. Requiring the **secret-holder** to fund first ensures the party who will reveal `t` has skin in the game before the counterparty locks theirs.
+
+**In the app:**
+
+- **Secret-holder** sees: fund now → save Recovery Kit (claim key + `t`) → wait for their fund + confirmations → claim first (reveals `t` on-chain).
+- **Second claimer** sees: wait (Fund button blocked until holder funded) → save Recovery Kit (claim key only) → fund your send leg → wait for confirmations → claim second (extract `t` from holder's on-chain signature).
+
+**Example (BTC → FB):** User A sends BTC, User B sends FB. If User B's refund unlocks earlier, **User B is secret-holder** → User B funds FB first; User A waits until B's fund is on-chain, then funds BTC.
 
 ---
 
